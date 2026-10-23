@@ -55,6 +55,145 @@ test('каталог переживает два последовательны�
   assert.equal(attempts, 3);
 });
 
+test('мобильная диагностика подтверждает серверу разбор успешного ответа без initData', async () => {
+  const reports = [];
+  const client = API.createApiClient({
+    mobileDiagnostics: true,
+    createRequestId: () => 'read-20261004-client-ack',
+    fetch: async (url, options = {}) => {
+      if (String(url).endsWith('/mobile-diagnostic')) {
+        reports.push({ url, options });
+        return { ok: true, async json() { return {}; } };
+      }
+      return { ok: true, status: 200, async json() { return { products: [] }; } };
+    },
+  });
+
+  await client.getCatalog();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(reports.length, 2);
+  assert.equal(reports[0].url, 'https://api.womanshop08.ru/api/mobile-diagnostic');
+  assert.deepEqual(JSON.parse(reports[0].options.body), {
+    mobileDiagnostic: true,
+    requestId: 'read-20261004-client-ack',
+    operation: 'catalog-read',
+    outcome: 'response-parsed',
+  });
+  assert.deepEqual(JSON.parse(reports[1].options.body), {
+    mobileDiagnostic: true,
+    requestId: 'read-20261004-client-ack',
+    operation: 'catalog-read',
+    outcome: 'response-normalized',
+  });
+  assert.equal(reports[0].options.headers['Content-Type'], 'text/plain;charset=UTF-8');
+  assert.doesNotMatch(reports[0].options.body, /initData|signed-telegram-data/);
+});
+
+test('мобильная диагностика передаёт только безопасный этап после разбора ответа', async () => {
+  const reports = [];
+  const client = API.createApiClient({
+    mobileDiagnostics: true,
+    fetch: async (url, options = {}) => {
+      if (String(url).endsWith('/mobile-diagnostic')) {
+        reports.push(JSON.parse(options.body));
+      }
+      return { ok: true, status: 204, async json() { return {}; } };
+    },
+  });
+
+  await client.reportMobileReadOutcome({
+    requestId: 'read-20261004-stage',
+    operation: 'catalog-read',
+  }, 'state-applied');
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(reports, [{
+    mobileDiagnostic: true,
+    requestId: 'read-20261004-stage',
+    operation: 'catalog-read',
+    outcome: 'state-applied',
+  }]);
+  assert.doesNotMatch(JSON.stringify(reports), /initData|product|telegram/i);
+});
+
+test('мобильное чтение возвращает отдельную квитанцию для этапов того же запроса', async () => {
+  const reports = [];
+  const client = API.createApiClient({
+    mobileDiagnostics: true,
+    createRequestId: () => 'read-20261004-receipt',
+    fetch: async (url, options = {}) => {
+      if (String(url).endsWith('/mobile-diagnostic')) reports.push(JSON.parse(options.body));
+      return { ok: true, status: 200, async json() { return { products: [] }; } };
+    },
+  });
+
+  const products = await client.getCatalog();
+  assert.deepEqual(products.mobileDiagnosticReceipt, {
+    requestId: 'read-20261004-receipt', operation: 'catalog-read',
+  });
+  assert.equal(Object.keys(products).includes('mobileDiagnosticReceipt'), false);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(reports, [{
+    mobileDiagnostic: true,
+    requestId: 'read-20261004-receipt',
+    operation: 'catalog-read',
+    outcome: 'response-parsed',
+  }, {
+    mobileDiagnostic: true,
+    requestId: 'read-20261004-receipt',
+    operation: 'catalog-read',
+    outcome: 'response-normalized',
+  }]);
+});
+
+test('каталог и список продавца не теряют все карточки из-за одной повреждённой записи ответа', async () => {
+  const client = API.createApiClient({
+    initData: 'signed-telegram-data',
+    fetch: async (url) => ({
+      ok: true,
+      status: 200,
+      async json() {
+        const products = [null, {
+          id: 12,
+          name: 'Надёжная карточка',
+          product_variants: { invalid: true },
+          product_images: { invalid: true },
+        }];
+        return String(url).endsWith('/admin-api') ? { products } : { products };
+      },
+    }),
+  });
+
+  const catalog = await client.getCatalog();
+  assert.equal(catalog.length, 1);
+  assert.equal(catalog[0].id, '12');
+  assert.equal(catalog[0].name, 'Надёжная карточка');
+  assert.deepEqual(catalog[0].variants, []);
+  assert.equal((await client.getAdminProducts()).length, 1);
+});
+
+test('каталог и список продавца нормализуются в WebView без Array.prototype.flatMap', async () => {
+  const client = API.createApiClient({
+    initData: 'signed-telegram-data',
+    fetch: async () => ({
+      ok: true,
+      status: 200,
+      async json() {
+        return { products: [{ id: 12, name: 'Надёжная карточка', product_variants: [], product_images: [] }] };
+      },
+    }),
+  });
+  const originalFlatMap = Array.prototype.flatMap;
+  Array.prototype.flatMap = undefined;
+  try {
+    assert.equal((await client.getCatalog()).length, 1);
+    assert.equal((await client.getAdminProducts()).length, 1);
+  } finally {
+    Array.prototype.flatMap = originalFlatMap;
+  }
+});
+
 test('изменяющие seller-операции не повторяются автоматически после сетевого сбоя', async () => {
   let attempts = 0;
   const client = API.createApiClient({
@@ -177,6 +316,57 @@ test('getCatalog запрещает браузеру использовать у
   await client.getCatalog();
 
   assert.equal(requestOptions.cache, 'no-store');
+});
+
+test('мобильная диагностика коррелирует только безопасные read-запросы', async () => {
+  const calls = [];
+  const events = [];
+  const client = API.createApiClient({
+    initData: 'signed-telegram-data',
+    mobileDiagnostics: true,
+    createRequestId: () => 'read-12345678',
+    onDiagnostic: (event) => events.push(event),
+    fetch: async (url, options) => {
+      calls.push({ url, body: options.body && JSON.parse(options.body) });
+      if (options.method === 'GET') return { ok: true, status: 200, async json() { return { products: [] }; } };
+      return { ok: true, status: 200, async json() { return { ok: true, data: { products: [] } }; } };
+    },
+  });
+
+  await client.getCatalog();
+  await client.getAdminProducts();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(calls[0].url, 'https://api.womanshop08.ru/api/catalog-api?mobileDiagnostic=1&requestId=read-12345678');
+  assert.deepEqual(calls.find((call) => call.body?.action === 'list').body, {
+    action: 'list', initData: 'signed-telegram-data', mobileDiagnostic: true, requestId: 'read-12345678',
+  });
+  assert.deepEqual(calls.filter((call) => String(call.url).endsWith('/mobile-diagnostic')).map((call) => call.body), [
+    { mobileDiagnostic: true, requestId: 'read-12345678', operation: 'catalog-read', outcome: 'response-parsed' },
+    { mobileDiagnostic: true, requestId: 'read-12345678', operation: 'catalog-read', outcome: 'response-normalized' },
+    { mobileDiagnostic: true, requestId: 'read-12345678', operation: 'admin-list-read', outcome: 'response-parsed' },
+    { mobileDiagnostic: true, requestId: 'read-12345678', operation: 'admin-list-read', outcome: 'response-normalized' },
+  ]);
+  assert.deepEqual(events.map((event) => [event.event, event.operation, event.requestId, event.attempt, event.httpStatus]), [
+    ['request-start', 'catalog-read', 'read-12345678', 1, null],
+    ['request-end', 'catalog-read', 'read-12345678', 1, 200],
+    ['request-start', 'admin-list-read', 'read-12345678', 1, null],
+    ['request-end', 'admin-list-read', 'read-12345678', 1, 200],
+  ]);
+});
+
+test('desktop read-запрос не получает mobile diagnostic параметры', async () => {
+  let url = '';
+  const client = API.createApiClient({
+    fetch: async (requestUrl) => {
+      url = requestUrl;
+      return { ok: true, async json() { return { products: [] }; } };
+    },
+  });
+
+  await client.getCatalog();
+
+  assert.equal(url, 'https://api.womanshop08.ru/api/catalog-api');
 });
 
 test('клиент привязывает относительную подписанную ссылку фото к origin Beget API', async () => {

@@ -111,8 +111,13 @@ button:active,
   overscroll-behavior-y: contain;
   -webkit-overflow-scrolling: touch;
   touch-action: pan-y;
-  animation: screen-in var(--transition);
+  /* Стартовый экран никогда не должен зависеть от анимации с opacity: 0:
+     Telegram iOS может оставить WebView на первом кадре. */
+  animation: none;
 }
+
+/* Сохраняем явную защиту для уже распознанного мобильного Telegram. */
+html[data-mobile-telegram="true"] #screen { animation: none; }
 
 .screen--full { padding-bottom: calc(24px + var(--safe-bottom)); }
 .screen--product { padding-bottom: calc(150px + var(--safe-bottom)); }
@@ -440,13 +445,26 @@ img { display: block; max-width: 100%; }
   .catalog-control .ui-icon { display: none; }
 }
 
-.product-gallery { position: relative; aspect-ratio: 0.83; overflow: hidden; background: linear-gradient(145deg, #e5edf2, #f8fafb); }
-.product-gallery__track { display: flex; width: 100%; height: 100%; overflow-x: auto; scroll-snap-type: x mandatory; scrollbar-width: none; overscroll-behavior-x: contain; }
+.product-gallery { position: relative; aspect-ratio: 1; overflow: hidden; background: linear-gradient(145deg, #e5edf2, #f8fafb); }
+.product-gallery__track { display: flex; width: 100%; height: 100%; overflow-x: auto; scroll-snap-type: x mandatory; scrollbar-width: none; overscroll-behavior-x: contain; touch-action: pan-x; }
 .product-gallery__track::-webkit-scrollbar { display: none; }
-.product-gallery__track img { flex: 0 0 100%; width: 100%; height: 100%; object-fit: cover; scroll-snap-align: start; }
+.product-gallery__trigger { display: block; flex: 0 0 100%; width: 100%; height: 100%; padding: 0; overflow: hidden; scroll-snap-align: start; border: 0; background: transparent; }
+.product-gallery__trigger img { width: 100%; height: 100%; object-fit: contain; }
 .gallery-dots { position: absolute; right: 12px; bottom: 12px; left: 12px; display: flex; justify-content: center; gap: 6px; pointer-events: none; }
 .gallery-dot { width: 7px; height: 7px; border-radius: 50%; background: rgba(255, 255, 255, 0.58); box-shadow: 0 1px 5px rgba(23, 33, 43, 0.22); }
 .gallery-dot.is-active { background: #fff; transform: scale(1.2); }
+
+.photo-viewer { position: fixed; z-index: 90; inset: 0; display: grid; place-items: stretch; color: #fff; }
+.photo-viewer__backdrop { position: absolute; inset: 0; width: 100%; height: 100%; padding: 0; border: 0; background: rgba(8, 12, 17, 0.94); }
+.photo-viewer__content { position: relative; z-index: 1; display: grid; min-width: 0; min-height: 0; grid-template-rows: auto minmax(0, 1fr); pointer-events: none; }
+.photo-viewer__header { display: flex; min-height: calc(56px + var(--safe-top)); padding: calc(8px + var(--safe-top)) 12px 8px 18px; align-items: center; justify-content: space-between; gap: 12px; pointer-events: auto; }
+.photo-viewer__counter { margin: 0; color: #fff; font-size: 14px; font-weight: 700; }
+.photo-viewer__close { border-color: rgba(255, 255, 255, 0.3); background: rgba(255, 255, 255, 0.12); color: #fff; }
+.photo-viewer__track { display: flex; min-width: 0; min-height: 0; overflow-x: auto; overflow-y: hidden; scroll-snap-type: x mandatory; scrollbar-width: none; overscroll-behavior-x: contain; pointer-events: auto; touch-action: pan-x; }
+.photo-viewer__track::-webkit-scrollbar { display: none; }
+.photo-viewer__slide { display: grid; flex: 0 0 100%; width: 100%; min-width: 0; min-height: 0; margin: 0; place-items: center; overflow: hidden; scroll-snap-align: start; }
+.photo-viewer__image { width: 100%; height: 100%; object-fit: contain; transform-origin: center; transition: transform 160ms ease; user-select: none; -webkit-user-drag: none; }
+.photo-viewer__track.is-zoomed { overflow-x: hidden; touch-action: none; }
 .product-info { padding: 12px 2px 4px; }
 .product-info h1 { margin-bottom: 8px; }
 .product-price { display: flex; align-items: baseline; margin-bottom: 14px; gap: 9px; }
@@ -474,6 +492,10 @@ img { display: block; max-width: 100%; }
 .color-button.is-active,
 .size-button.is-active { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-dark); box-shadow: 0 0 0 1px var(--accent); }
 .color-button.is-unavailable { border-style: dashed; opacity: 0.62; }
+.choice-grid--colors-text { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+.color-button--text { min-height: 32px; padding: 4px 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; text-decoration: underline 2px transparent; text-underline-offset: 6px; }
+.color-button--text.is-active { border: 0; background: transparent; box-shadow: none; color: var(--accent-dark); font-weight: 750; text-decoration-color: currentColor; }
+.color-button--text.is-unavailable { border: 0; text-decoration: line-through; }
 .size-button { display: grid; place-items: center; }
 .size-button small { color: var(--muted); font-size: 14px; }
 .size-button:disabled { border-color: transparent; background: color-mix(in srgb, var(--muted) 8%, var(--surface)); color: var(--muted); opacity: 0.38; cursor: not-allowed; text-decoration: line-through; }

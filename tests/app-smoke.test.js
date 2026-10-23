@@ -52,7 +52,7 @@ function createElement() {
   };
 }
 
-function loadApp(initialStorage = {}, api = null) {
+function loadApp(initialStorage = {}, api = null, platform = null, storageOptions = {}) {
   const elements = new Map([
     ['#screen', createElement()],
     ['#app', createElement()],
@@ -66,8 +66,10 @@ function loadApp(initialStorage = {}, api = null) {
     ...Object.entries(initialStorage),
   ]);
   const eventHandlers = new Map();
+  const diagnosticLogs = [];
   const document = {
     documentElement: createElement(),
+    visibilityState: 'visible',
     querySelector(selector) { return elements.get(selector) || null; },
     querySelectorAll() { return []; },
     addEventListener(type, handler) { eventHandlers.set(type, handler); },
@@ -78,25 +80,38 @@ function loadApp(initialStorage = {}, api = null) {
     FashionStoreCore: Core,
     FashionStoreUI: UI,
     FashionStoreApi: api,
+    FashionStorePlatform: platform,
     HTMLImageElement: class HTMLImageElement {},
     document,
     innerHeight: 800,
     innerWidth: 375,
     localStorage: {
-      getItem(key) { return storage.has(key) ? storage.get(key) : null; },
-      setItem(key, value) { storage.set(key, String(value)); },
-      removeItem(key) { storage.delete(key); },
+      getItem(key) {
+        storageOptions.getItem?.(key);
+        return storage.has(key) ? storage.get(key) : null;
+      },
+      setItem(key, value) {
+        storageOptions.setItem?.(key, value);
+        storage.set(key, String(value));
+      },
+      removeItem(key) {
+        storageOptions.removeItem?.(key);
+        storage.delete(key);
+      },
     },
     addEventListener() {},
     clearTimeout() {},
     setTimeout(callback) { callback(); return 1; },
+    console: { info(...values) { diagnosticLogs.push(values); } },
   };
   vm.runInNewContext(appSource, {
     window,
     document,
+    console: window.console,
     FormData: class FormData {},
     FileReader: class FileReader {},
     HTMLImageElement: window.HTMLImageElement,
+    Array,
     Intl,
     Map,
     Set,
@@ -108,8 +123,375 @@ function loadApp(initialStorage = {}, api = null) {
     modal: elements.get('#modal-root'),
     storage,
     document,
+    diagnosticLogs,
   };
 }
+
+test('мобильный Telegram заново загружает каталог после возврата Mini App из фона', async () => {
+  let catalogRequests = 0;
+  const api = {
+    createApiClient() {
+      return {
+        async getCatalog() {
+          catalogRequests += 1;
+          return [];
+        },
+      };
+    },
+  };
+  const platform = {
+    createPlatform() {
+      return {
+        isMobileTelegram: () => true,
+        ready() {},
+        expand() {},
+      };
+    },
+  };
+  const { document } = loadApp({}, api, platform);
+
+  await Promise.resolve();
+  assert.equal(catalogRequests, 1);
+
+  document.visibilityState = 'hidden';
+  document.dispatch('visibilitychange');
+  document.visibilityState = 'visible';
+  document.dispatch('visibilitychange');
+
+  await Promise.resolve();
+  assert.equal(catalogRequests, 2);
+});
+
+test('мобильный каталог достигает отрисовки без Array.prototype.flatMap', async () => {
+  const originalFlatMap = Array.prototype.flatMap;
+  Array.prototype.flatMap = undefined;
+  try {
+    const api = {
+      createApiClient() {
+        return {
+          async getCatalog() {
+            return [{ id: 'mobile-product', name: 'Совместимая карточка', category: 'all', price: 1000, images: [], colors: [], sizes: [], variants: [] }];
+          },
+        };
+      },
+    };
+    const platform = {
+      createPlatform() {
+        return { isMobileTelegram: () => true, ready() {}, expand() {} };
+      },
+    };
+    const { app, screen } = loadApp({}, api, platform);
+    await new Promise((resolve) => setImmediate(resolve));
+    app.navigate('catalog');
+    assert.match(screen.innerHTML, /Совместимая карточка/);
+    assert.doesNotMatch(screen.innerHTML, /Каталог временно недоступен/);
+  } finally {
+    Array.prototype.flatMap = originalFlatMap;
+  }
+});
+
+test('мобильный загрузчик отмечает применение состояния и вызов отрисовки для своего read-запроса', async () => {
+  const outcomes = [];
+  const products = [];
+  Object.defineProperty(products, 'mobileDiagnosticReceipt', {
+    value: { requestId: 'read-20261004-app-stage', operation: 'catalog-read' },
+  });
+  const api = {
+    createApiClient() {
+      return {
+        async getCatalog() { return products; },
+        reportMobileReadOutcome(receipt, outcome) { outcomes.push({ receipt, outcome }); },
+      };
+    },
+  };
+  const platform = {
+    createPlatform() {
+      return { isMobileTelegram: () => true, ready() {}, expand() {} };
+    },
+  };
+  loadApp({}, api, platform);
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(outcomes, [
+    { receipt: { requestId: 'read-20261004-app-stage', operation: 'catalog-read' }, outcome: 'state-applied' },
+    { receipt: { requestId: 'read-20261004-app-stage', operation: 'catalog-read' }, outcome: 'render-called' },
+  ]);
+});
+
+test('устаревшая ошибка каталога после возврата Mini App не заменяет новый успешный результат', async () => {
+  let catalogRequests = 0;
+  let resolveFreshCatalog;
+  let rejectStaleCatalog;
+  const api = {
+    createApiClient() {
+      return {
+        getCatalog() {
+          catalogRequests += 1;
+          if (catalogRequests === 1) return new Promise((_resolve, reject) => { rejectStaleCatalog = reject; });
+          return new Promise((resolve) => { resolveFreshCatalog = resolve; });
+        },
+      };
+    },
+  };
+  const platform = {
+    createPlatform() {
+      return { isMobileTelegram: () => true, ready() {}, expand() {} };
+    },
+  };
+  const { app, document, screen } = loadApp({}, api, platform);
+
+  document.visibilityState = 'hidden';
+  document.dispatch('visibilitychange');
+  document.visibilityState = 'visible';
+  document.dispatch('visibilitychange');
+  resolveFreshCatalog([]);
+  await new Promise((resolve) => setImmediate(resolve));
+  rejectStaleCatalog(new Error('Старый оборванный запрос'));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  app.navigate('catalog');
+  assert.match(screen.innerHTML, /Ассортимент скоро появится/);
+  assert.doesNotMatch(screen.innerHTML, /Каталог временно недоступен/);
+});
+
+test('устаревшая ошибка списка продавца после возврата Mini App не заменяет новый успешный результат', async () => {
+  let adminRequests = 0;
+  let resolveInitialAdmin;
+  let resolveFreshAdmin;
+  let rejectStaleAdmin;
+  const product = {
+    id: 'fresh-admin-after-resume', name: 'Свежая карточка', category: 'all', price: 4990,
+    images: [], colors: [], variants: [], adminStatus: 'published',
+  };
+  const api = {
+    createApiClient() {
+      return {
+        getCatalog: async () => [],
+        getAdminProducts() {
+          adminRequests += 1;
+          if (adminRequests === 1) return new Promise((resolve) => { resolveInitialAdmin = resolve; });
+          if (adminRequests === 2) return new Promise((_resolve, reject) => { rejectStaleAdmin = reject; });
+          return new Promise((resolve) => { resolveFreshAdmin = resolve; });
+        },
+      };
+    },
+  };
+  const platform = {
+    createPlatform() {
+      return { isMobileTelegram: () => true, ready() {}, expand() {} };
+    },
+  };
+  const { document, screen } = loadApp({}, api, platform);
+  const dispatchAction = (action) => document.dispatch('click', {
+    target: {
+      closest() { return { dataset: { action }, disabled: false, matches() { return false; } }; },
+    },
+  });
+
+  dispatchAction('open-seller-demo');
+  resolveInitialAdmin([]);
+  await new Promise((resolve) => setImmediate(resolve));
+  dispatchAction('reload-admin-products');
+  document.visibilityState = 'hidden';
+  document.dispatch('visibilitychange');
+  document.visibilityState = 'visible';
+  document.dispatch('visibilitychange');
+  resolveFreshAdmin([product]);
+  await new Promise((resolve) => setImmediate(resolve));
+  rejectStaleAdmin(new Error('Старый оборванный запрос'));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.match(screen.innerHTML, /Свежая карточка/);
+  assert.doesNotMatch(screen.innerHTML, /Старый оборванный запрос/);
+});
+
+test('мобильный Telegram пишет только безопасные lifecycle-поля диагностики', async () => {
+  const api = {
+    createApiClient() {
+      return { getCatalog: async () => [] };
+    },
+  };
+  const platform = {
+    createPlatform() {
+      return { isMobileTelegram: () => true, ready() {}, expand() {} };
+    },
+  };
+  const { document, diagnosticLogs } = loadApp({}, api, platform);
+
+  document.visibilityState = 'hidden';
+  document.dispatch('visibilitychange');
+  document.visibilityState = 'visible';
+  document.dispatch('visibilitychange');
+
+  const events = diagnosticLogs
+    .filter(([label]) => label === 'MOBILE_DIAGNOSTIC')
+    .map(([, value]) => JSON.parse(value));
+  assert.deepEqual(events.map((event) => event.event), ['page-load', 'visibility-hidden', 'visibility-visible']);
+  const allowed = new Set(['appVersion', 'pageInstanceId', 'lifecycleSequence', 'platform', 'screen', 'operation', 'requestId', 'attempt', 'startedAt', 'finishedAt', 'elapsedMs', 'outcome', 'httpStatus', 'errorCode', 'event']);
+  events.forEach((event) => Object.keys(event).forEach((key) => assert.ok(allowed.has(key))));
+  assert.ok(events.every((event) => event.platform === 'telegram-mobile' && event.pageInstanceId));
+});
+
+test('мобильный Telegram обновляет список админки после возврата из фона', async () => {
+  let adminRequests = 0;
+  const api = {
+    createApiClient() {
+      return {
+        async getCatalog() { return []; },
+        async getAdminProducts() {
+          adminRequests += 1;
+          return [];
+        },
+      };
+    },
+  };
+  const platform = {
+    createPlatform() {
+      return {
+        isMobileTelegram: () => true,
+        ready() {},
+        expand() {},
+      };
+    },
+  };
+  const { app, document } = loadApp({}, api, platform);
+  app.navigate('seller-products');
+
+  document.visibilityState = 'hidden';
+  document.dispatch('visibilitychange');
+  document.visibilityState = 'visible';
+  document.dispatch('visibilitychange');
+
+  await Promise.resolve();
+  assert.equal(adminRequests, 1);
+});
+
+test('мобильный Telegram не перерисовывает открытый редактор при возврате из фона', async () => {
+  let catalogRequests = 0;
+  const api = {
+    createApiClient() {
+      return {
+        async getCatalog() {
+          catalogRequests += 1;
+          return [];
+        },
+      };
+    },
+  };
+  const platform = {
+    createPlatform() {
+      return { isMobileTelegram: () => true, ready() {}, expand() {} };
+    },
+  };
+  const { app, document } = loadApp({}, api, platform);
+  await Promise.resolve();
+  app.navigate('seller-product-edit');
+
+  document.visibilityState = 'hidden';
+  document.dispatch('visibilitychange');
+  document.visibilityState = 'visible';
+  document.dispatch('visibilitychange');
+
+  await Promise.resolve();
+  assert.equal(catalogRequests, 2);
+});
+
+test('ответ фонового обновления списка не выбрасывает из открытого редактора', async () => {
+  let resolveAdminProducts;
+  const api = {
+    createApiClient() {
+      return {
+        async getCatalog() { return []; },
+        getAdminProducts() {
+          return new Promise((resolve) => { resolveAdminProducts = resolve; });
+        },
+      };
+    },
+  };
+  const platform = {
+    createPlatform() {
+      return { isMobileTelegram: () => true, ready() {}, expand() {} };
+    },
+  };
+  const { app, document, screen } = loadApp({}, api, platform);
+  app.navigate('seller-products');
+  document.visibilityState = 'hidden';
+  document.dispatch('visibilitychange');
+  document.visibilityState = 'visible';
+  document.dispatch('visibilitychange');
+  app.navigate('seller-product-edit');
+
+  resolveAdminProducts([]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(screen.dataset.screen, 'seller-product-edit');
+});
+
+test('ответ фонового обновления каталога не перерисовывает открытый редактор', async () => {
+  let catalogRequests = 0;
+  let resolveCatalog;
+  const api = {
+    createApiClient() {
+      return {
+        getCatalog() {
+          catalogRequests += 1;
+          if (catalogRequests === 1) return Promise.resolve([]);
+          return new Promise((resolve) => { resolveCatalog = resolve; });
+        },
+      };
+    },
+  };
+  const platform = {
+    createPlatform() {
+      return { isMobileTelegram: () => true, ready() {}, expand() {} };
+    },
+  };
+  const { app, document, screen } = loadApp({}, api, platform);
+  await new Promise((resolve) => setImmediate(resolve));
+  app.navigate('seller-products');
+  document.visibilityState = 'hidden';
+  document.dispatch('visibilitychange');
+  document.visibilityState = 'visible';
+  document.dispatch('visibilitychange');
+  app.navigate('seller-product-edit');
+  screen.innerHTML = '<input value="несохранённый текст">';
+
+  resolveCatalog([]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(screen.innerHTML, '<input value="несохранённый текст">');
+});
+
+test('ответ фонового обновления каталога не стирает незавершённую форму заказа', async () => {
+  let catalogRequests = 0;
+  let resolveCatalog;
+  const api = {
+    createApiClient() {
+      return {
+        getCatalog() {
+          catalogRequests += 1;
+          if (catalogRequests === 1) return Promise.resolve([]);
+          return new Promise((resolve) => { resolveCatalog = resolve; });
+        },
+      };
+    },
+  };
+  const platform = {
+    createPlatform() {
+      return { isMobileTelegram: () => true, ready() {}, expand() {} };
+    },
+  };
+  const { app, document, screen } = loadApp({}, api, platform);
+  await new Promise((resolve) => setImmediate(resolve));
+  app.navigate('checkout-contact');
+  screen.innerHTML = '<input value="Гиляна">';
+  document.visibilityState = 'hidden';
+  document.dispatch('visibilitychange');
+  document.visibilityState = 'visible';
+  document.dispatch('visibilitychange');
+
+  resolveCatalog([]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(screen.innerHTML, '<input value="Гиляна">');
+});
 
 test('админ-панель не меняет ширину при изменении visualViewport от фокуса', () => {
   assert.doesNotMatch(appSource, /window\.visualViewport\?\.width/);
@@ -124,19 +506,36 @@ test('Mini App запрещает автоматическое увеличен�
   assert.match(indexSource, /user-scalable=no/);
 });
 
+test('стартовый экран всегда видим, даже если Telegram не успел сообщить платформу', () => {
+  assert.match(stylesSource, /\.screen\s*\{[\s\S]*?animation:\s*none;/);
+  assert.doesNotMatch(stylesSource, /\.screen\s*\{[\s\S]*?animation:\s*screen-in/);
+});
+
 test('точка входа подключает платформенный адаптер до приложения', () => {
   assert.match(indexSource, /platform\.js\?v=20261003-mobile-save-correlation-1/);
   assert.ok(indexSource.indexOf('platform.js?v=20261003-mobile-save-correlation-1') < indexSource.indexOf('app.js?v='));
   assert.doesNotMatch(appSource, /window\.Telegram\?\.WebApp/);
 });
 
+test('внешний SDK Telegram не может заблокировать запуск локального каталога', () => {
+  assert.match(indexSource, /<script data-telegram-sdk-bootstrap>/);
+  assert.match(indexSource, /windowLike\.setTimeout\(startLocalModules, 1200\)/);
+  assert.match(indexSource, /script\.onload = loadNextModule/);
+  assert.doesNotMatch(indexSource, /<script(?:\s+[^>]*)?\ssrc="https:\/\/telegram\.org\/js\/telegram-web-app\.js"/);
+});
+
+test('приложение запускается и после завершения разбора HTML', () => {
+  assert.match(appSource, /document\.readyState === 'complete' \|\| document\.readyState === 'interactive'/);
+  assert.match(appSource, /\) \{\s*init\(\);\s*\} else \{/);
+});
+
 test('страница запрашивает свежие версии buyer-данных, каталога и редактора', () => {
-  assert.match(indexSource, /data\.js\?v=20260930-loading-fix-1/);
-  assert.match(indexSource, /styles\.css\?v=20260920-save-button-visible-1/);
+  assert.match(indexSource, /data\.js\?v=20261004-data-syntax-recovery-1/);
+  assert.match(indexSource, /styles\.css\?v=20261023-product-photo-viewer-1/);
   assert.match(indexSource, /admin-draft-store\.js\?v=20260904-admin-save-1/);
-  assert.match(indexSource, /api\.js\?v=20261003-mobile-save-cors-simple-1/);
-  assert.match(indexSource, /core\.js\?v=20261003-cart-reconcile-1/);
-  assert.match(indexSource, /app\.js\?v=20261003-mobile-save-cors-simple-1/);
+  assert.match(indexSource, /api\.js\?v=20261004-mobile-webview-compat-1/);
+  assert.match(indexSource, /core\.js\?v=20261004-mobile-webview-compat-1/);
+  assert.match(indexSource, /app\.js\?v=20261023-product-photo-viewer-1/);
 });
 
 test('нижняя навигация равномерно распределяет четыре раздела', () => {
@@ -204,10 +603,113 @@ test('после обновления каталога корзина показ
   assert.match(screen.innerHTML, />2<\/span>/);
 });
 
+test('мобильный Telegram показывает каталог после успешного ответа, даже если localStorage временно недоступен', async () => {
+  const mobilePlatform = {
+    createPlatform() {
+      return { isMobileTelegram: () => true, ready() {}, expand() {} };
+    },
+  };
+  const { app, screen } = loadApp({
+    'fashion-store-preorder-reset-v1': '1',
+  }, {
+    createApiClient() {
+      return {
+        getCatalog: async () => [{
+          id: 'storage-safe', name: 'Карточка после сбоя хранилища', price: 1,
+          images: [], colors: [], variants: [], adminStatus: 'published',
+        }],
+      };
+    },
+  }, mobilePlatform, {
+    setItem() { throw new Error('QuotaExceededError'); },
+  });
+
+  assert.equal(await app.loadRemoteCatalog(), true);
+  app.navigate('catalog');
+  assert.match(screen.innerHTML, /Карточка после сбоя хранилища/);
+});
+
 test('карточка товара содержит горизонтальную галерею всех фотографий', () => {
   assert.match(appSource, /product-gallery__track/);
   assert.match(appSource, /product\.images\.map/);
   assert.match(appSource, /gallery-dot/);
+});
+
+test('нажатие на фото товара открывает полноэкранный просмотр с выбранным кадром', async () => {
+  const { app, document, modal } = loadApp({}, {
+    createApiClient() {
+      return {
+        getCatalog: async () => [{
+          id: 'dress', name: 'Платье', price: 4990, category: 'dresses',
+          images: ['https://cdn.example/dress-front.webp', 'https://cdn.example/dress-back.webp'],
+          colors: [{ id: 'black', name: 'Чёрный', hex: '#242424' }],
+          variants: [{ id: 'dress-black-s', colorId: 'black', size: 'S', stock: 1, enabled: true }],
+          adminStatus: 'published',
+        }],
+      };
+    },
+  });
+
+  await app.loadRemoteCatalog();
+  app.navigate('product', { productId: 'dress' });
+  document.dispatch('click', {
+    target: {
+      closest() {
+        return {
+          dataset: { action: 'open-product-photo', productId: 'dress', photoIndex: '1' },
+          disabled: false,
+          matches() { return false; },
+        };
+      },
+    },
+  });
+
+  assert.match(modal.innerHTML, /Просмотр фото: Платье/);
+  assert.match(modal.innerHTML, /Фото 2 из 2/);
+  assert.match(modal.innerHTML, /dress-back\.webp/);
+
+  document.dispatch('click', {
+    target: {
+      closest() {
+        return {
+          dataset: { action: 'close-photo-viewer' },
+          disabled: false,
+          matches() { return false; },
+        };
+      },
+    },
+  });
+
+  assert.equal(modal.innerHTML, '');
+});
+
+test('карточка товара рендерит кнопки открытия для каждого фото', async () => {
+  const { app, screen } = loadApp({}, {
+    createApiClient() {
+      return {
+        getCatalog: async () => [{
+          id: 'dress', name: 'Платье', price: 4990, category: 'dresses',
+          images: ['https://cdn.example/dress-front.webp', 'https://cdn.example/dress-back.webp'],
+          colors: [{ id: 'black', name: 'Чёрный', hex: '#242424' }],
+          variants: [{ id: 'dress-black-s', colorId: 'black', size: 'S', stock: 1, enabled: true }],
+          adminStatus: 'published',
+        }],
+      };
+    },
+  });
+
+  await app.loadRemoteCatalog();
+  app.navigate('product', { productId: 'dress' });
+
+  assert.match(screen.innerHTML, /product-gallery__trigger/);
+  assert.match(screen.innerHTML, /data-action="open-product-photo"/);
+  assert.match(screen.innerHTML, /data-photo-index="0"/);
+  assert.match(screen.innerHTML, /data-photo-index="1"/);
+});
+
+test('стили просмотрщика ограничивают превью и содержат полноэкранный слой', () => {
+  assert.match(stylesSource, /\.product-gallery\s*\{[^}]*aspect-ratio:\s*1\s*;/);
+  assert.match(stylesSource, /\.photo-viewer\s*\{[^}]*position:\s*fixed/);
 });
 
 test('добавление размера определяет цвет из текущей карточки, даже до blur поля', () => {
@@ -314,17 +816,16 @@ test('оформление не блокируется старым заказо
   assert.match(appSource, /state\.demoOrders = \[demoOrder, \.\.\.state\.demoOrders/);
 });
 
-test('каталог не блокирует первый экран ожиданием фотографий и не предзагружает весь список', () => {
-  assert.doesNotMatch(appSource, /function preloadCatalogImages\(products\)/);
-  assert.doesNotMatch(appSource, /preloadCatalogImages\(state\.catalogProducts\)/);
+test('каталог не блокирует первый экран ожиданием фотографий', () => {
+  assert.match(appSource, /function preloadCatalogImages\(products\)/);
+  assert.match(appSource, /void preloadCatalogImages\(state\.catalogProducts\)/);
+  assert.doesNotMatch(appSource, /await preloadCatalogImages\(state\.catalogProducts\)/);
   assert.doesNotMatch(appSource, /window\.setTimeout\(\(\) => \{[\s\S]*void loadRemoteCatalog\(\);[\s\S]*\}, 300\)/);
 });
 
-test('первые две карточки каталога получают приоритет, остальные не конкурируют с ними', () => {
-  assert.match(appSource, /function productCard\(product, index\)/);
-  assert.match(appSource, /const isPriorityImage = index < 2/);
-  assert.match(appSource, /loading="\$\{isPriorityImage \? 'eager' : 'lazy'\}"/);
-  assert.match(appSource, /fetchpriority="\$\{isPriorityImage \? 'high' : 'auto'\}"/);
+test('фотографии карточек каталога загружаются сразу', () => {
+  assert.doesNotMatch(appSource, /<img src="\$\{escapeHtml\(image\)\}" alt="\$\{escapeHtml\(product\.name\)\}" loading="lazy">/);
+  assert.match(appSource, /fetchpriority="high"/);
 });
 
 test('в корзине нет лишнего текста о закреплении товара и резерве', () => {
@@ -711,6 +1212,26 @@ test('остаток одной единицы показывается поку
   app.selectSize('S');
   assert.match(screen.innerHTML, /Осталась 1 шт\./);
   assert.doesNotMatch(screen.innerHTML, /<span class="badge">Осталась 1 шт/);
+});
+
+test('покупатель выбирает цвет по текстовому названию без цветного маркера', async () => {
+  const product = {
+    id: 'text-color', groupId: 'text-color-group', name: 'Платье', category: 'all', price: 4990, oldPrice: null,
+    images: ['assets/preorder-hero.png'], colors: [{ id: 'black', name: 'Чёрный', hex: '#242424' }],
+    variants: [{ colorId: 'black', size: 'S', stock: 1 }], adminStatus: 'published',
+    description: '', composition: '', care: '', fit: '', model: '', measurements: {},
+  };
+  const { app, screen } = loadApp({}, {
+    createApiClient() {
+      return { getCatalog: async () => [product] };
+    },
+  });
+
+  await app.loadRemoteCatalog();
+  app.navigate('product', { productId: 'text-color' });
+
+  assert.match(screen.innerHTML, /class="color-button color-button--text is-active"[^>]*data-action="select-product-option"[^>]*>\s*Чёрный\s*<\/button>/);
+  assert.doesNotMatch(screen.innerHTML, /data-action="select-product-option"[^>]*>\s*<span[^>]*--swatch/);
 });
 
 test('доступный размер активен сразу при первом открытии карточки', async () => {

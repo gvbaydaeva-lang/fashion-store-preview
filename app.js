@@ -2,6 +2,8 @@
 (function createApp(window, document) {
   'use strict';
 
+  if (window.FashionStoreStartup?.hasFailed?.()) return;
+
   const Data = window.FashionStoreData;
   const Core = window.FashionStoreCore;
   const UI = window.FashionStoreUI;
@@ -24,7 +26,12 @@
   const PREORDER_RESET_KEY = 'fashion-store-preorder-reset-v1';
   const BOT_URL = Core.buildBotUrl('fashion_katalog_bot');
   const SHARE_TEXT = 'Посмотри «Выгодные покупки» в Telegram 🛍';
+  const MOBILE_DIAGNOSTIC_APP_VERSION = '20261004-mobile-stage-trace-1';
   const ROOT_SCREENS = new Set(['home', 'catalog', 'cart', 'orders', 'store']);
+  const MOBILE_RESUME_RENDER_SCREENS = new Set([
+    'home', 'catalog', 'product', 'cart', 'orders', 'store', 'payment-success', 'order-detail',
+    'seller-access', 'seller-products', 'seller-orders', 'seller-order', 'seller-users', 'seller-user',
+  ]);
   const CHECKOUT_SCREENS = new Set([
     'product', 'checkout-contact', 'checkout-delivery', 'checkout-review',
     'payment-success', 'order-detail', 'seller-access', 'seller-products',
@@ -103,14 +110,50 @@
   let toastTimer = null;
   let focusBeforeSheet = null;
   let apiClient = null;
+  let photoViewer = null;
+  const mobileTelegram = Boolean(platform?.isMobileTelegram?.());
+  const mobileDiagnosticPageInstanceId = window.crypto?.randomUUID?.() || `page-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  let mobileDiagnosticSequence = 0;
+  let mobileCatalogReadGeneration = 0;
+  let mobileAdminReadGeneration = 0;
+
+  function recordMobileDiagnostic(event, details = {}) {
+    if (!mobileTelegram) return;
+    const payload = {
+      appVersion: MOBILE_DIAGNOSTIC_APP_VERSION,
+      pageInstanceId: mobileDiagnosticPageInstanceId,
+      lifecycleSequence: ++mobileDiagnosticSequence,
+      platform: 'telegram-mobile',
+      screen: state.screen,
+      operation: details.operation || 'lifecycle',
+      requestId: details.requestId || null,
+      attempt: details.attempt || null,
+      startedAt: details.startedAt || Date.now(),
+      finishedAt: details.finishedAt || null,
+      elapsedMs: details.elapsedMs ?? null,
+      outcome: details.outcome || event,
+      httpStatus: details.httpStatus ?? null,
+      errorCode: details.errorCode || null,
+      event,
+    };
+    window.console?.info?.('MOBILE_DIAGNOSTIC', JSON.stringify(payload));
+  }
 
   try {
     apiClient = API?.createApiClient?.({
-      includeWriteRequestId: Boolean(platform?.isMobileTelegram?.()),
-      mobileSellerTransport: Boolean(platform?.isMobileTelegram?.()),
+      includeWriteRequestId: mobileTelegram,
+      mobileSellerTransport: mobileTelegram,
+      mobileDiagnostics: mobileTelegram,
+      onDiagnostic: (event) => recordMobileDiagnostic(event.event, event),
     }) || null;
   } catch (_error) {
     apiClient = null;
+  }
+
+  function reportMobileReadStage(products, outcome) {
+    const receipt = products?.mobileDiagnosticReceipt;
+    if (!mobileTelegram || !receipt || typeof apiClient?.reportMobileReadOutcome !== 'function') return;
+    void apiClient.reportMobileReadOutcome(receipt, outcome);
   }
 
   function icon(name, className = 'ui-icon') {
@@ -159,7 +202,11 @@
       const raw = window.localStorage.getItem(key);
       return raw == null ? fallback : JSON.parse(raw);
     } catch (_error) {
-      window.localStorage.removeItem(key);
+      try {
+        window.localStorage.removeItem(key);
+      } catch (storageError) {
+        if (!mobileTelegram) throw storageError;
+      }
       return fallback;
     }
   }
@@ -182,7 +229,11 @@
       ? storedDemoOrders.filter((order) => order && order.demoPayment === true && typeof order.id === 'string')
       : [];
     state.activeOrderId = state.orders[0]?.id || null;
-    window.localStorage.removeItem(ORDER_KEY);
+    try {
+      window.localStorage.removeItem(ORDER_KEY);
+    } catch (error) {
+      if (!mobileTelegram) throw error;
+    }
     state.checkoutIdempotencyKey = readStored(ORDER_IDEMPOTENCY_KEY, null);
     state.adminProducts = [];
     state.adminCategories = [];
@@ -196,17 +247,29 @@
   }
 
   function applyApprovedDemoReset() {
-    if (window.localStorage.getItem(PREORDER_RESET_KEY) === '1') return;
-    [CART_KEY, ORDER_KEY, ORDERS_KEY, ADMIN_PRODUCTS_KEY].forEach((key) => window.localStorage.removeItem(key));
-    window.localStorage.setItem(PREORDER_RESET_KEY, '1');
+    try {
+      if (window.localStorage.getItem(PREORDER_RESET_KEY) === '1') return;
+      [CART_KEY, ORDER_KEY, ORDERS_KEY, ADMIN_PRODUCTS_KEY].forEach((key) => window.localStorage.removeItem(key));
+      window.localStorage.setItem(PREORDER_RESET_KEY, '1');
+    } catch (error) {
+      if (!mobileTelegram) throw error;
+    }
   }
 
   function saveState() {
-    window.localStorage.setItem(CART_KEY, JSON.stringify(state.cart));
-    window.localStorage.setItem(ORDERS_KEY, JSON.stringify(state.orders));
-    window.localStorage.removeItem(ORDER_KEY);
-    if (state.checkoutIdempotencyKey) window.localStorage.setItem(ORDER_IDEMPOTENCY_KEY, state.checkoutIdempotencyKey);
-    else window.localStorage.removeItem(ORDER_IDEMPOTENCY_KEY);
+    try {
+      window.localStorage.setItem(CART_KEY, JSON.stringify(state.cart));
+      window.localStorage.setItem(ORDERS_KEY, JSON.stringify(state.orders));
+      window.localStorage.removeItem(ORDER_KEY);
+      if (state.checkoutIdempotencyKey) window.localStorage.setItem(ORDER_IDEMPOTENCY_KEY, state.checkoutIdempotencyKey);
+      else window.localStorage.removeItem(ORDER_IDEMPOTENCY_KEY);
+    } catch (error) {
+      // На iOS WebView localStorage может быть временно недоступен после
+      // возврата из фона. Каталог уже получен, поэтому сохраняем его на экране;
+      // следующая успешная запись восстановит локальный снимок.
+      if (!mobileTelegram) throw error;
+      recordMobileDiagnostic('local-storage-unavailable', { errorCode: 'local-storage' });
+    }
   }
 
   function saveDemoOrders() {
@@ -500,9 +563,101 @@
     modalRoot.querySelector('.sheet button, .sheet input, .sheet select')?.focus();
   }
 
+  function openProductPhotoViewer(productId, initialIndex) {
+    const product = getProduct(productId);
+    const images = Array.isArray(product?.images) && product.images.length
+      ? product.images
+      : ['assets/preorder-hero-bags.png'];
+    const index = Math.min(Math.max(Number(initialIndex) || 0, 0), images.length - 1);
+    focusBeforeSheet = document.activeElement;
+    appShell.inert = true;
+    photoViewer = { images, name: product?.name || 'Товар', index, scale: 1, pointers: new Map(), pinchStartDistance: 0, pinchStartScale: 1, lastTapAt: 0 };
+    renderPhotoViewer();
+  }
+
+  function renderPhotoViewer() {
+    if (!photoViewer) return;
+    const { images, name, index } = photoViewer;
+    modalRoot.innerHTML = `
+      <div class="photo-viewer" role="dialog" aria-modal="true" aria-label="Просмотр фото: ${escapeHtml(name)}">
+        <button class="photo-viewer__backdrop" type="button" data-action="close-photo-viewer" aria-label="Закрыть просмотр фото"></button>
+        <section class="photo-viewer__content">
+          <header class="photo-viewer__header">
+            <p class="photo-viewer__counter" aria-live="polite">Фото ${index + 1} из ${images.length}</p>
+            <button class="icon-button photo-viewer__close" type="button" data-action="close-photo-viewer" aria-label="Закрыть просмотр фото">${icon('close')}</button>
+          </header>
+          <div class="photo-viewer__track" data-photo-viewer-track>
+            ${images.map((image, imageIndex) => `<figure class="photo-viewer__slide"><img class="photo-viewer__image" src="${escapeHtml(image)}" alt="${escapeHtml(name)} — фото ${imageIndex + 1}" draggable="false"></figure>`).join('')}
+          </div>
+        </section>
+      </div>`;
+    modalRoot.querySelector('.photo-viewer__close')?.focus();
+    const track = modalRoot.querySelector('[data-photo-viewer-track]');
+    if (track) track.scrollLeft = track.clientWidth * index;
+  }
+
+  function setPhotoViewerIndex(index) {
+    if (!photoViewer) return;
+    photoViewer.index = Math.min(Math.max(index, 0), photoViewer.images.length - 1);
+    photoViewer.scale = 1;
+    const counter = modalRoot.querySelector('.photo-viewer__counter');
+    if (counter) counter.textContent = `Фото ${photoViewer.index + 1} из ${photoViewer.images.length}`;
+    updatePhotoViewerScale();
+  }
+
+  function updatePhotoViewerScale() {
+    if (!photoViewer) return;
+    const track = modalRoot.querySelector('[data-photo-viewer-track]');
+    const image = track?.querySelectorAll('.photo-viewer__image')?.[photoViewer.index];
+    track?.classList.toggle('is-zoomed', photoViewer.scale > 1);
+    if (image) image.style.transform = `scale(${photoViewer.scale})`;
+  }
+
+  function getPhotoViewerPointerDistance() {
+    if (!photoViewer || photoViewer.pointers.size !== 2) return 0;
+    const [first, second] = [...photoViewer.pointers.values()];
+    return Math.hypot(first.clientX - second.clientX, first.clientY - second.clientY);
+  }
+
+  function handlePhotoViewerPointerDown(event) {
+    const track = event.target.closest?.('[data-photo-viewer-track]');
+    if (!track || !photoViewer) return;
+    photoViewer.pointers.set(event.pointerId, { clientX: event.clientX, clientY: event.clientY });
+    if (photoViewer.pointers.size === 2) {
+      photoViewer.pinchStartDistance = getPhotoViewerPointerDistance();
+      photoViewer.pinchStartScale = photoViewer.scale;
+      return;
+    }
+    if (event.pointerType === 'touch') {
+      const now = Date.now();
+      if (now - photoViewer.lastTapAt < 280) {
+        photoViewer.scale = photoViewer.scale > 1 ? 1 : 2;
+        updatePhotoViewerScale();
+      }
+      photoViewer.lastTapAt = now;
+    }
+  }
+
+  function handlePhotoViewerPointerMove(event) {
+    if (!photoViewer?.pointers.has(event.pointerId)) return;
+    photoViewer.pointers.set(event.pointerId, { clientX: event.clientX, clientY: event.clientY });
+    if (photoViewer.pointers.size !== 2 || !photoViewer.pinchStartDistance) return;
+    event.preventDefault();
+    const nextScale = photoViewer.pinchStartScale * (getPhotoViewerPointerDistance() / photoViewer.pinchStartDistance);
+    photoViewer.scale = Math.min(3, Math.max(1, nextScale));
+    updatePhotoViewerScale();
+  }
+
+  function handlePhotoViewerPointerEnd(event) {
+    if (!photoViewer) return;
+    photoViewer.pointers.delete(event.pointerId);
+    if (photoViewer.pointers.size < 2) photoViewer.pinchStartDistance = 0;
+  }
+
   function closeSheet() {
     modalRoot.replaceChildren();
     appShell.inert = false;
+    photoViewer = null;
     focusBeforeSheet?.focus();
   }
 
@@ -518,7 +673,7 @@
   }
 
   function handleModalKeydown(event) {
-    const dialog = modalRoot.querySelector('.sheet');
+    const dialog = modalRoot.querySelector('.sheet, .photo-viewer');
     if (!dialog) return;
     if (event.key === 'Escape') {
       closeSheet();
@@ -541,6 +696,26 @@
     }
   }
 
+  function syncProductGalleryDots(track) {
+    const gallery = track.closest('.product-gallery');
+    const width = track.clientWidth;
+    if (!gallery || !width) return;
+    const activeIndex = Math.round(track.scrollLeft / width);
+    gallery.querySelectorAll('[data-gallery-dot]').forEach((dot, index) => {
+      dot.classList.toggle('is-active', index === activeIndex);
+    });
+  }
+
+  function handleGalleryScroll(event) {
+    const track = event.target;
+    if (track.matches?.('.product-gallery__track')) {
+      syncProductGalleryDots(track);
+      return;
+    }
+    if (!track.matches?.('[data-photo-viewer-track]') || !photoViewer || photoViewer.scale > 1 || !track.clientWidth) return;
+    setPhotoViewerIndex(Math.round(track.scrollLeft / track.clientWidth));
+  }
+
   function pageHeader(title, subtitle = '') {
     return `
       <header class="page-header">
@@ -555,17 +730,16 @@
       : '';
   }
 
-  function productCard(product, index) {
+  function productCard(product) {
     const sizes = [...new Set(product.variants
       .filter((variant) => variant.enabled !== false && Number(variant.stock) > 0)
       .map(({ size }) => size))];
     const image = product.images?.[0] || 'assets/preorder-hero-bags.png';
-    const isPriorityImage = index < 2;
     return `
       <article class="product-card card">
         <button class="product-card__open" type="button" data-action="open-product" data-product-id="${product.id}" aria-label="Открыть ${escapeHtml(product.name)}">
           <span class="product-card__media">
-            <img src="${escapeHtml(image)}" alt="${escapeHtml(product.name)}" loading="${isPriorityImage ? 'eager' : 'lazy'}" fetchpriority="${isPriorityImage ? 'high' : 'auto'}" decoding="async">
+            <img src="${escapeHtml(image)}" alt="${escapeHtml(product.name)}" loading="eager" fetchpriority="high" decoding="async">
             ${product.badge ? `<span class="badge">${escapeHtml(product.badge)}</span>` : ''}
           </span>
           <span class="product-card__body">
@@ -660,8 +834,8 @@
       const color = option.colors[0] || { id: option.id, name: 'Цвет' };
       const unavailable = !Core.hasAvailableVariant(option);
       return `
-      <button class="color-button ${option.id === product.id ? 'is-active' : ''}${unavailable ? ' is-unavailable' : ''}" type="button" data-action="select-product-option" data-product-id="${escapeHtml(option.id)}" aria-pressed="${option.id === product.id}"${unavailable ? ' aria-disabled="true"' : ''}>
-        <span style="--swatch:${color.hex || '#8e8e93'}" aria-hidden="true"></span>${escapeHtml(color.name)}
+      <button class="color-button color-button--text ${option.id === product.id ? 'is-active' : ''}${unavailable ? ' is-unavailable' : ''}" type="button" data-action="select-product-option" data-product-id="${escapeHtml(option.id)}" aria-pressed="${option.id === product.id}"${unavailable ? ' aria-disabled="true"' : ''}>
+        ${escapeHtml(color.name)}
       </button>`;
     }).join('');
     const colorVariants = product.variants.filter(({ colorId }) => colorId === state.selectedColorId);
@@ -687,9 +861,9 @@
       ${productBackHeader()}
       <section class="product-gallery card" aria-label="Фотографии ${escapeHtml(product.name)}">
         <div class="product-gallery__track">
-          ${galleryImages.map((image, index) => `<img src="${escapeHtml(image)}" alt="${escapeHtml(product.name)} — фото ${index + 1}" loading="eager" fetchpriority="${index ? 'auto' : 'high'}" decoding="async">`).join('')}
+          ${galleryImages.map((image, index) => `<button class="product-gallery__trigger" type="button" data-action="open-product-photo" data-product-id="${escapeHtml(product.id)}" data-photo-index="${index}" aria-label="Открыть фото ${index + 1} из ${galleryImages.length}: ${escapeHtml(product.name)}"><img src="${escapeHtml(image)}" alt="${escapeHtml(product.name)} — фото ${index + 1}" loading="eager" fetchpriority="${index ? 'auto' : 'high'}" decoding="async"></button>`).join('')}
         </div>
-        <div class="gallery-dots" aria-hidden="true">${galleryImages.map((_, index) => `<span class="gallery-dot${index === 0 ? ' is-active' : ''}"></span>`).join('')}</div>
+        <div class="gallery-dots" aria-hidden="true">${galleryImages.map((_, index) => `<span class="gallery-dot${index === 0 ? ' is-active' : ''}" data-gallery-dot="${index}"></span>`).join('')}</div>
         ${product.badge ? `<span class="badge">${escapeHtml(product.badge)}</span>` : ''}
       </section>
       <section class="product-info">
@@ -700,7 +874,7 @@
       </section>
       <section class="choice-section" id="product-choice">
         <div class="section-heading"><h2>Цвет</h2><span>${escapeHtml(product.colors[0]?.name || 'Не указан')}</span></div>
-        <div class="choice-grid choice-grid--colors">${colorButtons}</div>
+        <div class="choice-grid choice-grid--colors choice-grid--colors-text">${colorButtons}</div>
         <div class="section-heading"><h2>Размер</h2></div>
         <div class="choice-grid choice-grid--sizes ${sizes.length === 1 ? 'choice-grid--single' : sizes.length > 1 ? 'choice-grid--compact' : ''}">${sizeButtons}</div>
         ${colorUnavailable ? '<p class="choice-hint choice-hint--unavailable">Для этого цвета доступных размеров нет.</p>' : ''}
@@ -1641,12 +1815,14 @@
         return { id, name, sizeRows };
       }).filter(({ name }) => name);
       state.adminDraft.colors = parsedBlocks.map(({ id, name }) => ({ id, name }));
-      state.adminDraft.sizes = [...new Set(parsedBlocks.flatMap(({ sizeRows }) => sizeRows.map(({ size }) => size)))];
-      state.adminDraft.variants = parsedBlocks.flatMap(({ id, name, sizeRows }) => {
+      state.adminDraft.sizes = [...new Set(parsedBlocks.reduce((allSizes, { sizeRows }) => (
+        allSizes.concat(sizeRows.map(({ size }) => size))
+      ), []))];
+      state.adminDraft.variants = parsedBlocks.reduce((variants, { id, name, sizeRows }) => {
         const stockBySize = new Map(sizeRows.map(({ size, stock }) => [size, stock]));
-        return Core.buildColorVariants({ id, name }, sizeRows.map(({ size }) => size), previousVariants)
-          .map((variant) => ({ ...variant, stock: stockBySize.get(variant.size) ?? variant.stock }));
-      });
+        return variants.concat(Core.buildColorVariants({ id, name }, sizeRows.map(({ size }) => size), previousVariants)
+          .map((variant) => ({ ...variant, stock: stockBySize.get(variant.size) ?? variant.stock })));
+      }, []);
       state.adminColorEmptyRows = 0;
       state.adminSizeEmptyRows = {};
     }
@@ -2099,17 +2275,34 @@
       render({ preserveScroll: options.preserveScroll });
       return false;
     }
+    const readGeneration = mobileTelegram ? ++mobileAdminReadGeneration : 0;
+    const isCurrentRead = () => !mobileTelegram || readGeneration === mobileAdminReadGeneration;
+    let products = null;
+    let renderStarted = false;
     try {
-      const products = await apiClient.getAdminProducts();
+      products = await apiClient.getAdminProducts();
+      if (!isCurrentRead()) {
+        reportMobileReadStage(products, 'stale-discarded');
+        return false;
+      }
       state.adminProducts = Core.createAdminCatalog(products);
       rebuildAdminCategories();
       state.sellerAuthStatus = 'ready';
       state.sellerAuthError = '';
+      reportMobileReadStage(products, 'state-applied');
+      if (options.expectedScreen && state.screen !== options.expectedScreen) {
+        reportMobileReadStage(products, 'render-skipped-current-screen');
+        return true;
+      }
       state.screen = 'seller-products';
       state.history = [];
+      renderStarted = true;
       render({ preserveScroll: options.preserveScroll });
+      reportMobileReadStage(products, 'render-called');
       return true;
     } catch (error) {
+      if (products) reportMobileReadStage(products, renderStarted ? 'post-response-error-render' : 'post-response-error-state');
+      if (!isCurrentRead()) return false;
       state.sellerAuthError = error?.status === 403
         ? 'У тебя нет доступа к панели продавца.'
         : error?.status === 401
@@ -2121,6 +2314,7 @@
       const hasLoadedProducts = state.adminProducts.length > 0;
       state.sellerAuthStatus = hasLoadedProducts ? 'ready' : 'error';
       if (!hasLoadedProducts) state.adminProducts = [];
+      if (options.expectedScreen && state.screen !== options.expectedScreen) return false;
       render({ preserveScroll: options.preserveScroll });
       return false;
     }
@@ -2153,23 +2347,76 @@
 
   async function loadRemoteCatalog(options = {}) {
     if (!apiClient) return false;
+    const readGeneration = mobileTelegram ? ++mobileCatalogReadGeneration : 0;
+    const isCurrentRead = () => !mobileTelegram || readGeneration === mobileCatalogReadGeneration;
+    const canRender = () => options.render !== false
+      && (!options.expectedScreen || state.screen === options.expectedScreen);
+    let products = null;
+    let renderStarted = false;
     state.catalogStatus = 'loading';
     state.catalogError = '';
-    render({ preserveScroll: options.preserveScroll });
+    if (canRender()) render({ preserveScroll: options.preserveScroll });
     try {
-      const products = await apiClient.getCatalog(state.filters);
+      products = await apiClient.getCatalog(state.filters);
+      if (!isCurrentRead()) {
+        reportMobileReadStage(products, 'stale-discarded');
+        return false;
+      }
       state.catalogProducts = Core.createAdminCatalog(products);
       state.cart = Core.reconcileCart(state.cart, state.catalogProducts);
       saveState();
+      // Не блокируем первый экран мобильной сетью: карточки уже можно
+      // открыть после ответа API, а браузер догрузит изображения сам.
+      void preloadCatalogImages(state.catalogProducts);
       state.catalogStatus = 'ready';
-      render({ preserveScroll: options.preserveScroll });
+      reportMobileReadStage(products, 'state-applied');
+      if (canRender()) {
+        renderStarted = true;
+        render({ preserveScroll: options.preserveScroll });
+        reportMobileReadStage(products, 'render-called');
+      } else {
+        reportMobileReadStage(products, 'render-skipped-current-screen');
+      }
       return true;
     } catch (error) {
+      if (products) reportMobileReadStage(products, renderStarted ? 'post-response-error-render' : 'post-response-error-state');
+      if (!isCurrentRead()) return false;
       state.catalogStatus = 'error';
       state.catalogError = error?.message || 'Каталог временно недоступен.';
-      render({ preserveScroll: options.preserveScroll });
+      if (canRender()) render({ preserveScroll: options.preserveScroll });
       return false;
     }
+  }
+
+  function refreshAfterMobileResume() {
+    if (!platform?.isMobileTelegram?.() || document.visibilityState !== 'visible') return;
+    const resumeScreen = state.screen;
+    void loadRemoteCatalog({
+      preserveScroll: true,
+      expectedScreen: resumeScreen,
+      render: MOBILE_RESUME_RENDER_SCREENS.has(resumeScreen),
+    });
+    if (resumeScreen === 'seller-products') {
+      void loadRemoteAdminProducts({ preserveScroll: true, expectedScreen: resumeScreen });
+    }
+  }
+
+  function handleMobileVisibilityChange() {
+    recordMobileDiagnostic(document.visibilityState === 'visible' ? 'visibility-visible' : 'visibility-hidden');
+    refreshAfterMobileResume();
+  }
+
+  function preloadCatalogImages(products) {
+    if (typeof window.Image !== 'function') return Promise.resolve();
+    const urls = [...new Set((Array.isArray(products) ? products : []).reduce((allUrls, product) => (
+      allUrls.concat(Array.isArray(product?.images) ? product.images : [])
+    ), []).filter(Boolean))];
+    return Promise.all(urls.map((source) => new Promise((resolve) => {
+      const image = new window.Image();
+      image.onload = resolve;
+      image.onerror = resolve;
+      image.src = source;
+    })));
   }
 
   function refreshPublishedProductLists() {
@@ -2335,6 +2582,7 @@
     navigate: (control) => navigate(control.dataset.screen, {}, { root: true, fromNav: true }),
     'go-back': goBack,
     'open-product': (control) => navigate('product', { productId: control.dataset.productId }),
+    'open-product-photo': (control) => openProductPhotoViewer(control.dataset.productId, control.dataset.photoIndex),
     'open-category': (control) => {
       state.filters = { ...DEFAULT_FILTERS, category: control.dataset.category };
       navigate('catalog', {}, { root: true });
@@ -2451,6 +2699,7 @@
     'reload-admin-users': () => void loadRemoteAdminUsers(),
     'share-bot': shareBot,
     'close-sheet': closeSheet,
+    'close-photo-viewer': closeSheet,
     'reload-catalog': loadRemoteCatalog,
   };
 
@@ -2466,6 +2715,10 @@
     platform?.onThemeChanged?.(applyTelegramTheme);
     platform?.onViewportChanged?.(applyViewportHeight);
     window.addEventListener('orientationchange', applyViewportLayout);
+    if (mobileTelegram) {
+      document.addEventListener('visibilitychange', handleMobileVisibilityChange);
+      recordMobileDiagnostic('page-load');
+    }
     render();
     if (platform?.getInitData?.() && apiClient?.trackOpen) void apiClient.trackOpen().catch(() => {});
     void loadRemoteCatalog();
@@ -2544,6 +2797,11 @@
   });
 
   document.addEventListener('keydown', handleModalKeydown);
+  document.addEventListener('scroll', handleGalleryScroll, true);
+  document.addEventListener('pointerdown', handlePhotoViewerPointerDown);
+  document.addEventListener('pointermove', handlePhotoViewerPointerMove, { passive: false });
+  document.addEventListener('pointerup', handlePhotoViewerPointerEnd);
+  document.addEventListener('pointercancel', handlePhotoViewerPointerEnd);
   document.addEventListener('focusin', (event) => {
     if (!event.target.closest?.('#admin-product-form')) return;
     const resetHorizontalScroll = () => {
@@ -2583,5 +2841,11 @@
   }
 
   window.FashionStoreApp = { init, navigate, goBack, render, selectColor, selectProductOption, selectSize, loadRemoteCatalog, loadRemoteAdminUsers };
-  document.addEventListener('DOMContentLoaded', init, { once: true });
+  // Локальные модули могут быть добавлены после безопасного ожидания Telegram SDK.
+  // В таком случае DOMContentLoaded уже прошёл, поэтому стартуем сразу.
+  if (document.readyState === 'complete' || document.readyState === 'interactive') {
+    init();
+  } else {
+    document.addEventListener('DOMContentLoaded', init, { once: true });
+  }
 })(window, document);

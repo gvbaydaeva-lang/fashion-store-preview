@@ -10,7 +10,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Cormorant:wght@500;600;700&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="styles.css?v=20260920-save-button-visible-1">
+    <link rel="stylesheet" href="styles.css?v=20261023-product-photo-viewer-1">
   </head>
   <body>
     <div id="app" class="app-shell">
@@ -45,13 +45,112 @@
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <div id="modal-root"></div>
 
-    <script src="https://telegram.org/js/telegram-web-app.js"></script>
-    <script src="platform.js?v=20261003-mobile-save-correlation-1"></script>
-    <script src="data.js?v=20260930-loading-fix-1"></script>
-    <script src="core.js?v=20261003-cart-reconcile-1"></script>
-    <script src="ui.js"></script>
-    <script src="admin-draft-store.js?v=20260904-admin-save-1"></script>
-    <script src="api.js?v=20261003-mobile-save-cors-simple-1"></script>
-    <script src="app.js?v=20261003-mobile-save-cors-simple-1"></script>
+    <script data-startup-guard>
+      (function createStartupGuard(windowLike, documentLike) {
+        'use strict';
+
+        const releaseId = '20261008-unified-startup-guard-1';
+        let hasStartupFailure = false;
+
+        function resourceName(resource) {
+          return String(resource || 'неизвестный файл')
+            .split(/[?#]/, 1)[0]
+            .split('/')
+            .pop()
+            .replace(/[^a-zA-Z0-9._-]/g, '') || 'неизвестный файл';
+        }
+
+        function fail(resource) {
+          hasStartupFailure = true;
+          const screen = documentLike.querySelector('#screen');
+          if (!screen) return;
+
+          const failedResource = resourceName(resource);
+          screen.innerHTML = `
+            <section class="loading-screen" role="alert" aria-live="assertive">
+              <div class="brand-mark" aria-hidden="true">🛍</div>
+              <p class="eyebrow">🛍 Выгодные покупки</p>
+              <h1>Не удалось запустить приложение</h1>
+              <p>Не загрузился обязательный файл: <strong>${failedResource}</strong>.</p>
+              <p>Версия запуска: <strong>${releaseId}</strong>.</p>
+              <button class="primary-button" type="button" data-startup-retry>Повторить</button>
+            </section>
+          `;
+        }
+
+        documentLike.addEventListener('click', (event) => {
+          if (event.target.closest?.('[data-startup-retry]')) windowLike.location.reload();
+        });
+        documentLike.addEventListener('error', (event) => {
+          const target = event.target;
+          if (target?.tagName === 'SCRIPT' && target.dataset?.startupModule !== undefined) {
+            fail(target.src);
+          }
+        }, true);
+
+        windowLike.FashionStoreStartup = {
+          fail,
+          hasFailed: () => hasStartupFailure,
+        };
+      })(window, document);
+    </script>
+
+    <script data-telegram-sdk-bootstrap>
+      (function startMiniApp(documentLike, windowLike) {
+        'use strict';
+
+        const localModules = [
+          'platform.js?v=20261003-mobile-save-correlation-1',
+          'data.js?v=20261004-data-syntax-recovery-1',
+          'core.js?v=20261004-mobile-webview-compat-1',
+          'ui.js',
+          'admin-draft-store.js?v=20260904-admin-save-1',
+          'api.js?v=20261004-mobile-webview-compat-1',
+          'app.js?v=20261023-product-photo-viewer-1',
+        ];
+        let localModulesStarted = false;
+        let sdkTimeoutId = null;
+
+        function markMobileTelegram() {
+          const platform = String(windowLike.Telegram?.WebApp?.platform || '').toLowerCase();
+          if (platform === 'ios' || platform === 'android') {
+            documentLike.documentElement.dataset.mobileTelegram = 'true';
+          }
+        }
+
+        function startLocalModules() {
+          if (localModulesStarted) return;
+          localModulesStarted = true;
+          if (sdkTimeoutId != null) windowLike.clearTimeout(sdkTimeoutId);
+          markMobileTelegram();
+
+          let moduleIndex = 0;
+          function loadNextModule() {
+            const source = localModules[moduleIndex++];
+            if (!source) return;
+            const script = documentLike.createElement('script');
+            script.src = source;
+            script.dataset.startupModule = '';
+            script.onload = loadNextModule;
+            script.onerror = () => windowLike.FashionStoreStartup?.fail(script.src);
+            documentLike.body.appendChild(script);
+          }
+          loadNextModule();
+        }
+
+        if (windowLike.Telegram?.WebApp) {
+          startLocalModules();
+          return;
+        }
+
+        const sdk = documentLike.createElement('script');
+        sdk.async = true;
+        sdk.src = 'https://telegram.org/js/telegram-web-app.js';
+        sdk.onload = startLocalModules;
+        sdk.onerror = startLocalModules;
+        sdkTimeoutId = windowLike.setTimeout(startLocalModules, 1200);
+        documentLike.head.appendChild(sdk);
+      })(document, window);
+    </script>
   </body>
 </html>

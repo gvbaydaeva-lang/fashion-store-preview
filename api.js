@@ -67,8 +67,9 @@
   }
 
   function normalizeProduct(product, baseUrl = '') {
-    const variants = Array.isArray(product?.product_variants)
-      ? product.product_variants.map((variant) => ({
+    const serverVariants = Array.isArray(product?.product_variants) ? product.product_variants : [];
+    const variants = serverVariants.length
+      ? serverVariants.map((variant) => ({
         ...(variant.id == null ? {} : { id: variant.id }),
         colorId: variant.color_id ?? variant.colorId,
         size: variant.size_value ?? variant.size,
@@ -93,7 +94,7 @@
       ? product.product_colors.map((color) => ({ id: color.id, name: color.name }))
       : Array.isArray(product?.colors) ? product.colors : [];
     const colors = explicitColors.length ? explicitColors : [...new Map(
-      (product?.product_variants || []).map((variant) => {
+      serverVariants.map((variant) => {
         const id = variant.color_id ?? variant.colorId;
         return [id, { id, name: variant.color_name ?? variant.colorName ?? id }];
       }).filter(([id]) => id != null),
@@ -102,7 +103,7 @@
       ? product.product_sizes.map((size) => size.value)
       : Array.isArray(product?.sizes) ? product.sizes : [];
     const sizes = explicitSizes.length ? explicitSizes : [...new Set(
-      (product?.product_variants || [])
+      serverVariants
         .map((variant) => variant.size_value ?? variant.size)
         .filter((size) => size != null),
     )];
@@ -122,6 +123,22 @@
       sizes,
       variants,
     };
+  }
+
+  function normalizeProducts(products, baseUrl = '') {
+    if (!Array.isArray(products)) return [];
+    const normalized = [];
+    products.forEach((product) => {
+      // Один некорректный элемент ответа не должен прятать весь каталог или
+      // список продавца после уже успешного HTTP-ответа.
+      if (!product || typeof product !== 'object' || product.id == null) return;
+      try {
+        normalized.push(normalizeProduct(product, baseUrl));
+      } catch (_error) {
+        // Один повреждённый товар не отменяет весь ответ каталога.
+      }
+    });
+    return normalized;
   }
 
   function normalizeOrder(order, baseUrl = '') {
@@ -246,14 +263,57 @@
     }
 
     const includeWriteRequestId = options.includeWriteRequestId === true;
+    const mobileDiagnostics = options.mobileDiagnostics === true;
+    const onDiagnostic = typeof options.onDiagnostic === 'function' ? options.onDiagnostic : null;
     // Telegram iOS/Android отправляет seller-JSON как простой запрос, чтобы
     // не выполнять отдельный CORS preflight к API на другом домене.
     const mobileSellerTransport = options.mobileSellerTransport === true;
 
     function createRequestId() {
+      if (typeof options.createRequestId === 'function') return options.createRequestId();
       const randomUuid = window.crypto?.randomUUID?.bind(window.crypto);
       if (typeof randomUuid === 'function') return randomUuid();
       return `save-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+    }
+
+    function emitDiagnostic(event, details = {}) {
+      if (!mobileDiagnostics || !onDiagnostic) return;
+      onDiagnostic({ event, ...details, startedAt: details.startedAt || Date.now(), finishedAt: details.finishedAt || null, elapsedMs: details.elapsedMs ?? null, httpStatus: details.httpStatus ?? null, errorCode: details.errorCode || null });
+    }
+
+    const MOBILE_READ_OPERATIONS = new Set(['catalog-read', 'admin-list-read']);
+    const MOBILE_READ_OUTCOMES = new Set([
+      'response-parsed', 'response-normalized', 'state-applied',
+      'render-called', 'render-skipped-current-screen', 'stale-discarded',
+      'post-response-error-state', 'post-response-error-render',
+    ]);
+
+    function reportMobileReadOutcome(receipt, outcome) {
+      if (!mobileDiagnostics || !receipt?.requestId
+        || !MOBILE_READ_OPERATIONS.has(receipt.operation)
+        || !MOBILE_READ_OUTCOMES.has(outcome)) return Promise.resolve();
+      return Promise.resolve()
+        .then(() => requestFetch(`${baseUrl}/mobile-diagnostic`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+          body: JSON.stringify({
+            mobileDiagnostic: true,
+            requestId: receipt.requestId,
+            operation: receipt.operation,
+            outcome,
+          }),
+          keepalive: true,
+        }))
+        .catch(() => {});
+    }
+
+    function attachMobileReadReceipt(value, receipt) {
+      if (!mobileDiagnostics || !receipt?.requestId || !value || typeof value !== 'object') return value;
+      Object.defineProperty(value, 'mobileDiagnosticReceipt', {
+        value: Object.freeze({ requestId: receipt.requestId, operation: receipt.operation }),
+        enumerable: false,
+      });
+      return value;
     }
 
     function requestWithTimeout(url, requestOptions, requestTimeoutMs = timeoutMs) {
@@ -285,12 +345,17 @@
       });
     }
 
-    async function requestWithRetry(url, requestOptions, retryable = false, requestTimeoutMs = timeoutMs) {
+    async function requestWithRetry(url, requestOptions, retryable = false, requestTimeoutMs = timeoutMs, diagnostic = null) {
       const attempts = retryable ? 3 : 1;
       for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        const startedAt = Date.now();
+        if (diagnostic) emitDiagnostic('request-start', { ...diagnostic, attempt, startedAt, outcome: 'started' });
         try {
-          return await requestWithTimeout(url, requestOptions, requestTimeoutMs);
+          const response = await requestWithTimeout(url, requestOptions, requestTimeoutMs);
+          if (diagnostic) emitDiagnostic('request-end', { ...diagnostic, attempt, startedAt, finishedAt: Date.now(), elapsedMs: Date.now() - startedAt, outcome: 'received', httpStatus: response.status || 200 });
+          return response;
         } catch (error) {
+          if (diagnostic) emitDiagnostic('request-error', { ...diagnostic, attempt, startedAt, finishedAt: Date.now(), elapsedMs: Date.now() - startedAt, outcome: 'error', httpStatus: error?.status || null, errorCode: error?.code || 'network-error' });
           const canRetry = retryable
             && attempt < attempts
             && (error?.code === 'timeout' || !(error instanceof FashionStoreApiError));
@@ -307,22 +372,35 @@
         if (value == null || value === '' || (Array.isArray(value) && !value.length)) return;
         query.set(key, Array.isArray(value) ? value.join(',') : String(value));
       });
+      const requestId = mobileDiagnostics ? createRequestId() : '';
+      if (requestId) {
+        query.set('mobileDiagnostic', '1');
+        query.set('requestId', requestId);
+      }
       const suffix = query.toString() ? `?${query.toString()}` : '';
-      const response = await requestWithRetry(`${baseUrl}/catalog-api${suffix}`, { method: 'GET', cache: 'no-store' }, true);
+      const diagnostic = requestId ? { operation: 'catalog-read', requestId } : null;
+      const response = await requestWithRetry(`${baseUrl}/catalog-api${suffix}`, { method: 'GET', cache: 'no-store' }, true, timeoutMs, diagnostic);
       const data = await readResponse(response);
-      return (Array.isArray(data.products) ? data.products : []).map((product) => normalizeProduct(product, baseUrl));
+      void reportMobileReadOutcome(diagnostic, 'response-parsed');
+      const products = normalizeProducts(data.products, baseUrl);
+      void reportMobileReadOutcome(diagnostic, 'response-normalized');
+      return attachMobileReadReceipt(products, diagnostic);
     }
 
     async function adminRequest(action, payload = {}) {
       const readOnlyAction = ['list', 'list-users', 'get-user', 'get-save-result'].includes(action);
-      const requestId = !readOnlyAction && includeWriteRequestId ? createRequestId() : '';
+      const diagnosticRead = readOnlyAction && mobileDiagnostics;
+      const requestId = diagnosticRead || (!readOnlyAction && includeWriteRequestId) ? createRequestId() : '';
       try {
         const response = await requestWithRetry(`${baseUrl}/admin-api`, {
           method: 'POST',
           headers: { 'Content-Type': mobileSellerTransport ? 'text/plain;charset=UTF-8' : 'application/json' },
-          body: JSON.stringify({ action, initData: options.initData ?? getInitData(), ...payload, ...(requestId ? { requestId } : {}) }),
-        }, readOnlyAction, readOnlyAction ? timeoutMs : writeTimeoutMs);
-        return await readResponse(response);
+          body: JSON.stringify({ action, initData: options.initData ?? getInitData(), ...payload, ...(diagnosticRead ? { mobileDiagnostic: true } : {}), ...(requestId ? { requestId } : {}) }),
+        }, readOnlyAction, readOnlyAction ? timeoutMs : writeTimeoutMs, diagnosticRead ? { operation: action === 'list' ? 'admin-list-read' : `admin-${action}-read`, requestId } : null);
+        const data = await readResponse(response);
+        const diagnostic = diagnosticRead ? { operation: action === 'list' ? 'admin-list-read' : `admin-${action}-read`, requestId } : null;
+        void reportMobileReadOutcome(diagnostic, 'response-parsed');
+        return attachMobileReadReceipt(data, diagnostic);
       } catch (error) {
         if (requestId && !error?.requestId) error.requestId = requestId;
         throw error;
@@ -389,6 +467,7 @@
 
     return {
       getCatalog,
+      reportMobileReadOutcome,
       async trackOpen() {
         return userRequest('track-open');
       },
@@ -424,7 +503,9 @@
       },
       async getAdminProducts(filters) {
         const data = await adminRequest('list', { filters });
-        return (Array.isArray(data.products) ? data.products : []).map((product) => normalizeProduct(product, baseUrl));
+        const products = normalizeProducts(data.products, baseUrl);
+        void reportMobileReadOutcome(data.mobileDiagnosticReceipt, 'response-normalized');
+        return attachMobileReadReceipt(products, data.mobileDiagnosticReceipt);
       },
       async listAdminUsers(filters = {}) {
         const data = await adminRequest('list-users', filters);
