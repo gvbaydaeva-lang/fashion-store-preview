@@ -531,11 +531,11 @@ test('приложение запускается и после завершен
 
 test('страница запрашивает свежие версии buyer-данных, каталога и редактора', () => {
   assert.match(indexSource, /data\.js\?v=20261004-data-syntax-recovery-1/);
-  assert.match(indexSource, /styles\.css\?v=20261023-product-photo-viewer-1/);
+  assert.match(indexSource, /styles\.css\?v=20261024-product-photo-viewer-pointer-control-1/);
   assert.match(indexSource, /admin-draft-store\.js\?v=20260904-admin-save-1/);
   assert.match(indexSource, /api\.js\?v=20261004-mobile-webview-compat-1/);
   assert.match(indexSource, /core\.js\?v=20261004-mobile-webview-compat-1/);
-  assert.match(indexSource, /app\.js\?v=20261023-product-photo-viewer-1/);
+  assert.match(indexSource, /app\.js\?v=20261024-product-photo-viewer-pointer-control-1/);
 });
 
 test('нижняя навигация равномерно распределяет четыре раздела', () => {
@@ -710,6 +710,250 @@ test('карточка товара рендерит кнопки открыти
 test('стили просмотрщика ограничивают превью и содержат полноэкранный слой', () => {
   assert.match(stylesSource, /\.product-gallery\s*\{[^}]*aspect-ratio:\s*1\s*;/);
   assert.match(stylesSource, /\.photo-viewer\s*\{[^}]*position:\s*fixed/);
+});
+
+test('просмотрщик с первого касания сам управляет жестом, свайпом и перемещением увеличенного фото', async () => {
+  const { app, document, modal } = loadApp({}, {
+    createApiClient() {
+      return {
+        getCatalog: async () => [{
+          id: 'dress', name: 'Платье', price: 4990, category: 'dresses',
+          images: ['https://cdn.example/dress-front.webp', 'https://cdn.example/dress-back.webp'],
+          colors: [{ id: 'black', name: 'Чёрный', hex: '#242424' }],
+          variants: [{ id: 'dress-black-s', colorId: 'black', size: 'S', stock: 1, enabled: true }],
+          adminStatus: 'published',
+        }],
+      };
+    },
+  });
+  const images = [
+    { style: {}, naturalWidth: 600, naturalHeight: 1200 },
+    { style: {}, naturalWidth: 600, naturalHeight: 1200 },
+  ];
+  const track = {
+    classList: createClassList(),
+    clientWidth: 320,
+    clientHeight: 520,
+    scrollLeft: 0,
+    matches(selector) { return selector === '[data-photo-viewer-track]'; },
+    querySelectorAll(selector) { return selector === '.photo-viewer__image' ? images : []; },
+    setPointerCapture() {},
+    releasePointerCapture() {},
+  };
+  modal.querySelector = (selector) => {
+    if (selector === '[data-photo-viewer-track]') return track;
+    if (selector === '.photo-viewer__close') return { focus() {} };
+    if (selector === '.photo-viewer__counter') return { textContent: '' };
+    return null;
+  };
+
+  await app.loadRemoteCatalog();
+  app.navigate('product', { productId: 'dress' });
+  document.dispatch('click', {
+    target: { closest: () => ({ dataset: { action: 'open-product-photo', productId: 'dress', photoIndex: '0' }, disabled: false, matches() { return false; } }) },
+  });
+
+  const pointer = (type, pointerId, clientX, clientY) => document.dispatch(type, {
+    pointerId,
+    clientX,
+    clientY,
+    pointerType: 'touch',
+    target: { closest: () => track },
+    preventDefault() {},
+  });
+  pointer('pointerdown', 1, 260, 300);
+  pointer('pointermove', 1, 80, 300);
+  pointer('pointerup', 1, 80, 300);
+  assert.equal(track.scrollLeft, 320);
+
+  pointer('pointerdown', 2, 100, 300);
+  pointer('pointerdown', 3, 200, 300);
+  pointer('pointermove', 3, 300, 300);
+  pointer('pointerup', 2, 100, 300);
+  pointer('pointerup', 3, 300, 300);
+  pointer('pointerdown', 4, 160, 300);
+  pointer('pointermove', 4, 160, 180);
+  assert.match(images[1].style.transform, /translate3d\(0px, -120px, 0\) scale\(2\)/);
+});
+
+test('один свайп в просмотрщике с тремя фото переходит только на соседний кадр', async () => {
+  const { app, document, modal } = loadApp({}, {
+    createApiClient() {
+      return { getCatalog: async () => [{
+        id: 'dress', name: 'Платье', price: 4990, category: 'dresses',
+        images: ['https://cdn.example/dress-1.webp', 'https://cdn.example/dress-2.webp', 'https://cdn.example/dress-3.webp'],
+        colors: [], variants: [], adminStatus: 'published',
+      }] };
+    },
+  });
+  const track = {
+    classList: createClassList(), clientWidth: 320, clientHeight: 520, scrollLeft: 0,
+    matches(selector) { return selector === '[data-photo-viewer-track]'; },
+    querySelectorAll() { return []; }, setPointerCapture() {}, releasePointerCapture() {},
+  };
+  modal.querySelector = (selector) => {
+    if (selector === '[data-photo-viewer-track]') return track;
+    if (selector === '.photo-viewer__close') return { focus() {} };
+    if (selector === '.photo-viewer__counter') return { textContent: '' };
+    return null;
+  };
+  await app.loadRemoteCatalog();
+  app.navigate('product', { productId: 'dress' });
+  document.dispatch('click', { target: { closest: () => ({ dataset: { action: 'open-product-photo', productId: 'dress', photoIndex: '0' }, disabled: false, matches() { return false; } }) } });
+  const pointer = (type, clientX) => document.dispatch(type, {
+    type, pointerId: 1, clientX, clientY: 300, pointerType: 'touch', target: { closest: () => track }, preventDefault() {},
+  });
+  pointer('pointerdown', 260);
+  pointer('pointermove', 80);
+  document.dispatch('scroll', { target: track });
+  pointer('pointermove', 80);
+  pointer('pointerup', 80);
+  assert.equal(track.scrollLeft, 320);
+});
+
+test('отменённый системой свайп возвращает просмотрщик к целому кадру', async () => {
+  const { app, document, modal } = loadApp({}, {
+    createApiClient() {
+      return { getCatalog: async () => [{
+        id: 'dress', name: 'Платье', price: 4990, category: 'dresses',
+        images: ['https://cdn.example/dress-1.webp', 'https://cdn.example/dress-2.webp'], colors: [], variants: [], adminStatus: 'published',
+      }] };
+    },
+  });
+  const track = {
+    classList: createClassList(), clientWidth: 320, clientHeight: 520, scrollLeft: 0,
+    matches(selector) { return selector === '[data-photo-viewer-track]'; },
+    querySelectorAll() { return []; }, setPointerCapture() {}, releasePointerCapture() {},
+  };
+  modal.querySelector = (selector) => {
+    if (selector === '[data-photo-viewer-track]') return track;
+    if (selector === '.photo-viewer__close') return { focus() {} };
+    return null;
+  };
+  await app.loadRemoteCatalog();
+  app.navigate('product', { productId: 'dress' });
+  document.dispatch('click', { target: { closest: () => ({ dataset: { action: 'open-product-photo', productId: 'dress', photoIndex: '0' }, disabled: false, matches() { return false; } }) } });
+  const pointer = (type, clientX) => document.dispatch(type, {
+    type, pointerId: 1, clientX, clientY: 300, pointerType: 'touch', target: { closest: () => track }, preventDefault() {},
+  });
+  pointer('pointerdown', 260);
+  pointer('pointermove', 150);
+  assert.equal(track.scrollLeft, 110);
+  pointer('pointercancel', 150);
+  assert.equal(track.scrollLeft, 0);
+});
+
+test('увеличенный кадр можно перемещать и он сбрасывается при смене фото', async () => {
+  const { app, document, modal } = loadApp({}, {
+    createApiClient() {
+      return {
+        getCatalog: async () => [{
+          id: 'dress', name: 'Платье', price: 4990, category: 'dresses',
+          images: ['https://cdn.example/dress-front.webp', 'https://cdn.example/dress-back.webp'],
+          colors: [{ id: 'black', name: 'Чёрный', hex: '#242424' }],
+          variants: [{ id: 'dress-black-s', colorId: 'black', size: 'S', stock: 1, enabled: true }],
+          adminStatus: 'published',
+        }],
+      };
+    },
+  });
+  const images = [
+    { style: {}, naturalWidth: 600, naturalHeight: 1200 },
+    { style: {}, naturalWidth: 1200, naturalHeight: 600 },
+  ];
+  const track = {
+    classList: createClassList(),
+    clientWidth: 320,
+    clientHeight: 520,
+    scrollLeft: 0,
+    matches(selector) { return selector === '[data-photo-viewer-track]'; },
+    querySelectorAll(selector) { return selector === '.photo-viewer__image' ? images : []; },
+    setPointerCapture() {},
+  };
+  modal.querySelector = (selector) => {
+    if (selector === '[data-photo-viewer-track]') return track;
+    if (selector === '.photo-viewer__close') return { focus() {} };
+    return null;
+  };
+
+  await app.loadRemoteCatalog();
+  app.navigate('product', { productId: 'dress' });
+  document.dispatch('click', {
+    target: { closest: () => ({ dataset: { action: 'open-product-photo', productId: 'dress', photoIndex: '0' }, disabled: false, matches() { return false; } }) },
+  });
+
+  const pointer = (type, pointerId, clientX, clientY) => document.dispatch(type, {
+    pointerId,
+    clientX,
+    clientY,
+    pointerType: 'touch',
+    target: { closest: () => track },
+    preventDefault() {},
+  });
+  pointer('pointerdown', 1, 100, 300);
+  pointer('pointerdown', 2, 200, 300);
+  pointer('pointermove', 2, 300, 300);
+  pointer('pointerup', 2, 300, 300);
+  pointer('pointermove', 1, 70, 260);
+
+  assert.match(images[0].style.transform, /translate3d\(/);
+  assert.match(images[0].style.transform, /scale\(2\)/);
+
+  pointer('pointermove', 1, -1000, 2000);
+  assert.equal(images[0].style.transform, 'translate3d(-100px, 260px, 0) scale(2)');
+
+  pointer('pointerup', 1, -1000, 2000);
+  pointer('pointerdown', 3, 120, 280);
+  pointer('pointerup', 3, 120, 280);
+  pointer('pointerdown', 4, 120, 280);
+  pointer('pointerup', 4, 120, 280);
+  track.scrollLeft = 320;
+  document.dispatch('scroll', { target: track });
+  assert.equal(images[1].style.transform, 'translate3d(0px, 0px, 0) scale(1)');
+});
+
+test('граница вертикального сдвига берётся из видимой области кадра, а не из высоты трека', async () => {
+  const { app, document, modal } = loadApp({}, {
+    createApiClient() {
+      return { getCatalog: async () => [{
+        id: 'dress', name: 'Платье', price: 4990, category: 'dresses',
+        images: ['https://cdn.example/dress-front.webp'], colors: [], variants: [], adminStatus: 'published',
+      }] };
+    },
+  });
+  const slide = { getBoundingClientRect: () => ({ width: 320, height: 420 }) };
+  const image = {
+    style: {}, naturalWidth: 600, naturalHeight: 1200,
+    closest(selector) { return selector === '.photo-viewer__slide' ? slide : null; },
+  };
+  const track = {
+    classList: createClassList(), clientWidth: 320, clientHeight: 520, scrollLeft: 0,
+    matches(selector) { return selector === '[data-photo-viewer-track]'; },
+    querySelectorAll(selector) { return selector === '.photo-viewer__image' ? [image] : []; },
+    setPointerCapture() {}, releasePointerCapture() {},
+  };
+  modal.querySelector = (selector) => {
+    if (selector === '[data-photo-viewer-track]') return track;
+    if (selector === '.photo-viewer__close') return { focus() {} };
+    return null;
+  };
+  await app.loadRemoteCatalog();
+  app.navigate('product', { productId: 'dress' });
+  document.dispatch('click', { target: { closest: () => ({ dataset: { action: 'open-product-photo', productId: 'dress', photoIndex: '0' }, disabled: false, matches() { return false; } }) } });
+  const pointer = (type, pointerId, clientX, clientY) => document.dispatch(type, {
+    pointerId, clientX, clientY, pointerType: 'touch', target: { closest: () => track }, preventDefault() {},
+  });
+  pointer('pointerdown', 1, 100, 300);
+  pointer('pointerdown', 2, 200, 300);
+  pointer('pointermove', 2, 300, 300);
+  pointer('pointerup', 2, 300, 300);
+  pointer('pointermove', 1, 100, -1000);
+  assert.equal(image.style.transform, 'translate3d(0px, -210px, 0) scale(2)');
+});
+
+test('полноэкранный просмотр ограничен актуальной высотой Mini App', () => {
+  assert.match(stylesSource, /\.photo-viewer\s*\{[^}]*height:\s*var\(--app-height\)/);
+  assert.match(stylesSource, /\.photo-viewer__content\s*\{[^}]*height:\s*100%/);
 });
 
 test('добавление размера определяет цвет из текущей карточки, даже до blur поля', () => {

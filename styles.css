@@ -454,17 +454,17 @@ img { display: block; max-width: 100%; }
 .gallery-dot { width: 7px; height: 7px; border-radius: 50%; background: rgba(255, 255, 255, 0.58); box-shadow: 0 1px 5px rgba(23, 33, 43, 0.22); }
 .gallery-dot.is-active { background: #fff; transform: scale(1.2); }
 
-.photo-viewer { position: fixed; z-index: 90; inset: 0; display: grid; place-items: stretch; color: #fff; }
+.photo-viewer { position: fixed; z-index: 90; top: 0; left: 50%; width: min(100%, var(--app-width)); height: var(--app-height); overflow: hidden; display: grid; place-items: stretch; color: #fff; transform: translateX(-50%); }
 .photo-viewer__backdrop { position: absolute; inset: 0; width: 100%; height: 100%; padding: 0; border: 0; background: rgba(8, 12, 17, 0.94); }
-.photo-viewer__content { position: relative; z-index: 1; display: grid; min-width: 0; min-height: 0; grid-template-rows: auto minmax(0, 1fr); pointer-events: none; }
+.photo-viewer__content { position: relative; z-index: 1; display: grid; width: 100%; height: 100%; min-width: 0; min-height: 0; grid-template-rows: auto minmax(0, 1fr); pointer-events: none; }
 .photo-viewer__header { display: flex; min-height: calc(56px + var(--safe-top)); padding: calc(8px + var(--safe-top)) 12px 8px 18px; align-items: center; justify-content: space-between; gap: 12px; pointer-events: auto; }
 .photo-viewer__counter { margin: 0; color: #fff; font-size: 14px; font-weight: 700; }
 .photo-viewer__close { border-color: rgba(255, 255, 255, 0.3); background: rgba(255, 255, 255, 0.12); color: #fff; }
-.photo-viewer__track { display: flex; min-width: 0; min-height: 0; overflow-x: auto; overflow-y: hidden; scroll-snap-type: x mandatory; scrollbar-width: none; overscroll-behavior-x: contain; pointer-events: auto; touch-action: pan-x; }
+.photo-viewer__track { display: flex; min-width: 0; min-height: 0; padding-bottom: var(--safe-bottom); overflow: hidden; scrollbar-width: none; overscroll-behavior: contain; pointer-events: auto; touch-action: none; }
 .photo-viewer__track::-webkit-scrollbar { display: none; }
 .photo-viewer__slide { display: grid; flex: 0 0 100%; width: 100%; min-width: 0; min-height: 0; margin: 0; place-items: center; overflow: hidden; scroll-snap-align: start; }
-.photo-viewer__image { width: 100%; height: 100%; object-fit: contain; transform-origin: center; transition: transform 160ms ease; user-select: none; -webkit-user-drag: none; }
-.photo-viewer__track.is-zoomed { overflow-x: hidden; touch-action: none; }
+.photo-viewer__image { width: 100%; height: 100%; object-fit: contain; transform-origin: center; transition: transform 160ms ease; user-select: none; will-change: transform; -webkit-user-drag: none; }
+.photo-viewer__track.is-dragging .photo-viewer__image { transition: none; }
 .product-info { padding: 12px 2px 4px; }
 .product-info h1 { margin-bottom: 8px; }
 .product-price { display: flex; align-items: baseline; margin-bottom: 14px; gap: 9px; }

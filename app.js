@@ -571,7 +571,22 @@
     const index = Math.min(Math.max(Number(initialIndex) || 0, 0), images.length - 1);
     focusBeforeSheet = document.activeElement;
     appShell.inert = true;
-    photoViewer = { images, name: product?.name || 'Товар', index, scale: 1, pointers: new Map(), pinchStartDistance: 0, pinchStartScale: 1, lastTapAt: 0 };
+    photoViewer = {
+      images,
+      name: product?.name || 'Товар',
+      index,
+      scale: 1,
+      panX: 0,
+      panY: 0,
+      panStartX: 0,
+      panStartY: 0,
+      swipeStartIndex: null,
+      pointers: new Map(),
+      pinchStartDistance: 0,
+      pinchStartScale: 1,
+      lastTapAt: 0,
+      didPinch: false,
+    };
     renderPhotoViewer();
   }
 
@@ -599,18 +614,61 @@
   function setPhotoViewerIndex(index) {
     if (!photoViewer) return;
     photoViewer.index = Math.min(Math.max(index, 0), photoViewer.images.length - 1);
-    photoViewer.scale = 1;
+    resetPhotoViewerTransform();
     const counter = modalRoot.querySelector('.photo-viewer__counter');
     if (counter) counter.textContent = `Фото ${photoViewer.index + 1} из ${photoViewer.images.length}`;
     updatePhotoViewerScale();
   }
 
-  function updatePhotoViewerScale() {
+  function snapPhotoViewerToIndex(index) {
+    if (!photoViewer) return;
+    setPhotoViewerIndex(index);
+    const track = modalRoot.querySelector('[data-photo-viewer-track]');
+    if (track) track.scrollLeft = track.clientWidth * photoViewer.index;
+  }
+
+  function resetPhotoViewerTransform() {
+    if (!photoViewer) return;
+    photoViewer.scale = 1;
+    photoViewer.panX = 0;
+    photoViewer.panY = 0;
+    photoViewer.panStartX = 0;
+    photoViewer.panStartY = 0;
+    photoViewer.swipeStartIndex = null;
+  }
+
+  function clampPhotoViewerPan() {
     if (!photoViewer) return;
     const track = modalRoot.querySelector('[data-photo-viewer-track]');
     const image = track?.querySelectorAll('.photo-viewer__image')?.[photoViewer.index];
+    const slideRect = image?.closest?.('.photo-viewer__slide')?.getBoundingClientRect?.();
+    const viewportWidth = Number(slideRect?.width) || track?.clientWidth || 0;
+    const viewportHeight = Number(slideRect?.height) || track?.clientHeight || 0;
+    const naturalWidth = Number(image?.naturalWidth) || viewportWidth;
+    const naturalHeight = Number(image?.naturalHeight) || viewportHeight;
+    const imageScale = Math.min(viewportWidth / naturalWidth, viewportHeight / naturalHeight);
+    const displayedWidth = naturalWidth * imageScale;
+    const displayedHeight = naturalHeight * imageScale;
+    const maxPanX = Math.max(0, (displayedWidth * photoViewer.scale - viewportWidth) / 2);
+    const maxPanY = Math.max(0, (displayedHeight * photoViewer.scale - viewportHeight) / 2);
+    photoViewer.panX = Math.min(maxPanX, Math.max(-maxPanX, photoViewer.panX));
+    photoViewer.panY = Math.min(maxPanY, Math.max(-maxPanY, photoViewer.panY));
+  }
+
+  function updatePhotoViewerScale() {
+    if (!photoViewer) return;
+    const track = modalRoot.querySelector('[data-photo-viewer-track]');
     track?.classList.toggle('is-zoomed', photoViewer.scale > 1);
-    if (image) image.style.transform = `scale(${photoViewer.scale})`;
+    track?.querySelectorAll('.photo-viewer__image').forEach((image, index) => {
+      image.style.transform = index === photoViewer.index
+        ? `translate3d(${photoViewer.panX}px, ${photoViewer.panY}px, 0) scale(${photoViewer.scale})`
+        : 'translate3d(0px, 0px, 0) scale(1)';
+    });
+  }
+
+  function setPhotoViewerDragging(isDragging) {
+    const track = modalRoot.querySelector('[data-photo-viewer-track]');
+    track?.classList.toggle('is-dragging', isDragging);
   }
 
   function getPhotoViewerPointerDistance() {
@@ -622,36 +680,103 @@
   function handlePhotoViewerPointerDown(event) {
     const track = event.target.closest?.('[data-photo-viewer-track]');
     if (!track || !photoViewer) return;
-    photoViewer.pointers.set(event.pointerId, { clientX: event.clientX, clientY: event.clientY });
+    track.setPointerCapture?.(event.pointerId);
+    photoViewer.pointers.set(event.pointerId, {
+      clientX: event.clientX,
+      clientY: event.clientY,
+      startX: event.clientX,
+      startY: event.clientY,
+      pointerType: event.pointerType,
+      moved: false,
+    });
+    setPhotoViewerDragging(true);
     if (photoViewer.pointers.size === 2) {
       photoViewer.pinchStartDistance = getPhotoViewerPointerDistance();
       photoViewer.pinchStartScale = photoViewer.scale;
+      photoViewer.didPinch = true;
       return;
     }
-    if (event.pointerType === 'touch') {
-      const now = Date.now();
-      if (now - photoViewer.lastTapAt < 280) {
-        photoViewer.scale = photoViewer.scale > 1 ? 1 : 2;
-        updatePhotoViewerScale();
-      }
-      photoViewer.lastTapAt = now;
-    }
+    if (photoViewer.scale <= 1) photoViewer.swipeStartIndex = photoViewer.index;
+    photoViewer.panStartX = photoViewer.panX;
+    photoViewer.panStartY = photoViewer.panY;
   }
 
   function handlePhotoViewerPointerMove(event) {
     if (!photoViewer?.pointers.has(event.pointerId)) return;
-    photoViewer.pointers.set(event.pointerId, { clientX: event.clientX, clientY: event.clientY });
-    if (photoViewer.pointers.size !== 2 || !photoViewer.pinchStartDistance) return;
+    const pointer = photoViewer.pointers.get(event.pointerId);
+    pointer.moved = pointer.moved || Math.hypot(event.clientX - pointer.startX, event.clientY - pointer.startY) > 8;
+    pointer.clientX = event.clientX;
+    pointer.clientY = event.clientY;
+    if (photoViewer.pointers.size === 2 && photoViewer.pinchStartDistance) {
+      event.preventDefault();
+      const nextScale = photoViewer.pinchStartScale * (getPhotoViewerPointerDistance() / photoViewer.pinchStartDistance);
+      photoViewer.scale = Math.min(3, Math.max(1, nextScale));
+      clampPhotoViewerPan();
+      updatePhotoViewerScale();
+      return;
+    }
     event.preventDefault();
-    const nextScale = photoViewer.pinchStartScale * (getPhotoViewerPointerDistance() / photoViewer.pinchStartDistance);
-    photoViewer.scale = Math.min(3, Math.max(1, nextScale));
+    if (photoViewer.scale <= 1) {
+      const track = event.target.closest?.('[data-photo-viewer-track]');
+      const width = track?.clientWidth || 0;
+      if (track && width) {
+        const maxScrollLeft = width * (photoViewer.images.length - 1);
+        const swipeStartIndex = Number.isInteger(photoViewer.swipeStartIndex) ? photoViewer.swipeStartIndex : photoViewer.index;
+        track.scrollLeft = Math.min(maxScrollLeft, Math.max(0, (width * swipeStartIndex) - (event.clientX - pointer.startX)));
+      }
+      return;
+    }
+    photoViewer.panX = photoViewer.panStartX + event.clientX - pointer.startX;
+    photoViewer.panY = photoViewer.panStartY + event.clientY - pointer.startY;
+    clampPhotoViewerPan();
     updatePhotoViewerScale();
   }
 
   function handlePhotoViewerPointerEnd(event) {
-    if (!photoViewer) return;
+    if (!photoViewer?.pointers.has(event.pointerId)) return;
+    const pointer = photoViewer.pointers.get(event.pointerId);
+    const wasSinglePointer = photoViewer.pointers.size === 1;
+    const track = event.target.closest?.('[data-photo-viewer-track]');
+    track?.releasePointerCapture?.(event.pointerId);
     photoViewer.pointers.delete(event.pointerId);
-    if (photoViewer.pointers.size < 2) photoViewer.pinchStartDistance = 0;
+    if (photoViewer.pointers.size < 2) {
+      photoViewer.pinchStartDistance = 0;
+      const remainingPointer = photoViewer.pointers.values().next().value;
+      if (remainingPointer) {
+        remainingPointer.startX = remainingPointer.clientX;
+        remainingPointer.startY = remainingPointer.clientY;
+        photoViewer.panStartX = photoViewer.panX;
+        photoViewer.panStartY = photoViewer.panY;
+      }
+    }
+    if (!wasSinglePointer || photoViewer.didPinch || pointer.moved || pointer.pointerType !== 'touch' || event.type === 'pointercancel') {
+      if (!photoViewer.pointers.size) {
+        photoViewer.didPinch = false;
+        setPhotoViewerDragging(false);
+      }
+      const swipeStartIndex = Number.isInteger(photoViewer.swipeStartIndex) ? photoViewer.swipeStartIndex : photoViewer.index;
+      if (wasSinglePointer && pointer.moved && photoViewer.scale <= 1 && event.type === 'pointercancel') {
+        snapPhotoViewerToIndex(swipeStartIndex);
+      } else if (wasSinglePointer && pointer.moved && photoViewer.scale <= 1) {
+        const horizontalDistance = event.clientX - pointer.startX;
+        const swipeThreshold = Math.max(48, (track?.clientWidth || 0) * 0.18);
+        const direction = horizontalDistance <= -swipeThreshold ? 1 : horizontalDistance >= swipeThreshold ? -1 : 0;
+        snapPhotoViewerToIndex(swipeStartIndex + direction);
+      }
+      if (!photoViewer.pointers.size) photoViewer.swipeStartIndex = null;
+      return;
+    }
+    const now = Date.now();
+    if (now - photoViewer.lastTapAt < 280) {
+      if (photoViewer.scale > 1) resetPhotoViewerTransform();
+      else photoViewer.scale = 2;
+      updatePhotoViewerScale();
+      photoViewer.lastTapAt = 0;
+      setPhotoViewerDragging(false);
+      return;
+    }
+    photoViewer.lastTapAt = now;
+    setPhotoViewerDragging(false);
   }
 
   function closeSheet() {
@@ -712,7 +837,7 @@
       syncProductGalleryDots(track);
       return;
     }
-    if (!track.matches?.('[data-photo-viewer-track]') || !photoViewer || photoViewer.scale > 1 || !track.clientWidth) return;
+    if (!track.matches?.('[data-photo-viewer-track]') || !photoViewer || photoViewer.scale > 1 || track.classList?.contains('is-dragging') || !track.clientWidth) return;
     setPhotoViewerIndex(Math.round(track.scrollLeft / track.clientWidth));
   }
 

@@ -122,7 +122,7 @@ test('обязательные локальные модули остаются 
     'ui.js',
     'admin-draft-store.js?v=20260904-admin-save-1',
     'api.js?v=20261004-mobile-webview-compat-1',
-    'app.js?v=20261023-product-photo-viewer-1',
+    'app.js?v=20261024-product-photo-viewer-pointer-control-1',
   ]);
   localScripts.forEach(({ dataset }) => assert.equal(dataset.startupModule, ''));
 
